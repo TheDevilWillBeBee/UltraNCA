@@ -50,8 +50,8 @@ constexpr bool A100_CLASS = NCA_A100_CLASS;
 #ifndef NCA_ADJ_CPT
 #define NCA_ADJ_CPT 2
 #endif
-#ifndef NCA_ADJ_ROWS
-#define NCA_ADJ_ROWS 1
+#ifndef NCA_FWD_TAIL     // forward: the items of the last partial wave run as two half-height blocks each (launch_forward)
+#define NCA_FWD_TAIL NCA_A100_CLASS   // A100: 2.5 % faster forward at 2.4 waves (512 blocks on 216 slots)
 #endif
 constexpr int TILE_W = 16;                            // pixels per warp row = MMA M; must stay 16
 constexpr int FWD_WARPS = NCA_FWD_WARPS;              // forward: warps per block
@@ -415,18 +415,31 @@ constexpr int fwd_min_blocks()
 #endif
 }
 
-// grid (column strips * segments, N); each block: one segment of `seg` rows of one 16-pixel column strip
+// 1-D grid of work items (image, segment of `seg` rows, 16-pixel column strip; strips fastest): the first `items`
+// blocks are whole items, the remaining ones the two halves of the last (gridDim.x - items) / 2 items (a split tail:
+// a partial last wave of half-length blocks instead of whole ones)
 template <int C, int HID, bool FP32, bool STOCH, bool ALIVE>
 __global__ void __launch_bounds__(FWD_THREADS, fwd_min_blocks<C, HID, FP32>()) forward_kernel(
     const float *__restrict__ x, const float *__restrict__ w1, const float *__restrict__ b1, const float *__restrict__ w2,
-    float *__restrict__ y, float *__restrict__ alpha, int B, int H, int W, uint64_t seed, float update_rate, int seg)
+    float *__restrict__ y, float *__restrict__ alpha, int B, int H, int W, uint64_t seed, float update_rate, int seg, int items)
 {
     using S = Shape<C, HID>;
     extern __shared__ __align__(16) unsigned char smem_raw[];
     auto &sm = *reinterpret_cast<ForwardSmem<C, HID, FP32> *>(smem_raw);
 
-    const int n = blockIdx.y, k = n / B, strips = (W + TILE_W - 1) / TILE_W;
-    const int x0 = (blockIdx.x % strips) * TILE_W, y0 = (blockIdx.x / strips) * seg, y1 = min(H, y0 + seg);
+    const int strips = (W + TILE_W - 1) / TILE_W, segs = (H + seg - 1) / seg;
+    int item = blockIdx.x, part = -1;
+    if (item >= items) {
+        part = (item - items) % 2;
+        item = items + (item - items) / 2;
+    }
+    const int n = item / (strips * segs), k = n / B, rem = item % (strips * segs);
+    const int x0 = (rem % strips) * TILE_W;
+    int y0 = (rem / strips) * seg, y1 = min(H, y0 + seg);
+    if (part >= 0) {
+        const int mid = (y0 + y1) / 2;
+        (part == 0 ? y1 : y0) = mid;
+    }
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, g = lane / 4, t = lane % 4;
     const size_t plane = (size_t)H * W;
     const float *xn = x + n * C * plane;
@@ -706,7 +719,7 @@ constexpr int BWD_TILES_PER_BLOCK = NCA_BWD_TILES_PER_BLOCK;  // tiles of one im
 constexpr int BWD_MIN_BLOCKS = NCA_BWD_MIN_BLOCKS;            // resident blocks per SM (register bound via __launch_bounds__)
 constexpr int BWD_UNROLL = NCA_BWD_UNROLL;                    // unrolling of the per-hidden-tile dh / dp loop (registers)
 #ifndef NCA_ABLATE
-#define NCA_ABLATE 0   // profiling only: 1 = skip weight gradients, 2 = skip dp stores, 4 = weight fragments made up in registers (no loads), 8 = dp stores all to one record
+#define NCA_ABLATE 0   // profiling only: 1 = skip weight gradients, 2 = skip dp stores, 4 = weight fragments made up in registers (no loads), 8 = dp stores all to one record, 16 = no barriers around the dW2 phase
 #endif
 
 template <int C, int HID>
@@ -949,7 +962,8 @@ __global__ void __launch_bounds__(BWD_THREADS, BWD_MIN_BLOCKS) backward_kernel(
 
             // ---- dW2 += gm^T relu(h) over the round's pixels (occupied k-steps only). Each warp owns NIW
             //      hidden n-tiles, so one B fragment serves all m-tiles and the A fragments are shared by its n-tiles.
-            __syncthreads();
+            if (!(NCA_ABLATE & 16))
+                __syncthreads();
             if (!(NCA_ABLATE & 1))
 #pragma unroll
                 for (int kk = 0; kk < BWD_PIX / 8; ++kk) {
@@ -970,7 +984,8 @@ __global__ void __launch_bounds__(BWD_THREADS, BWD_MIN_BLOCKS) backward_kernel(
                             mma<FP32>(accg[mi][q], ag2[mi], b);
                     }
                 }
-            __syncthreads();  // relu(h) and its buffers are free
+            if (!(NCA_ABLATE & 16))
+                __syncthreads();  // relu(h) and its buffers are free
 
             // ---- per hidden n-tile j: dh (registers; [h > 0] read from this lane's staged relu(h)), dp += dh W1
             //      (MMA, permuted hidden index as in the forward), dh staged for dW1 and db1 (with two parts: the
@@ -1133,34 +1148,32 @@ __global__ void reduce_kernel(const float *__restrict__ partial, int blocks_per_
 }
 
 // dx = g (* a) + sum_o sum_f K_f(o) dp_{4c+f}(y - o), the transpose of the circular perception filters, over the
-// updating pixels' dp (pixel-major, (N, H, W, 4C); not written elsewhere). A block takes ADJ_ROWS rows of 32 pixels
-// of an image (a 2-D patch: the neighbour records of adjacent pixels are reused through L1) and all C channels,
-// ADJ_CPT channels per thread (more loads in flight per thread; latency-bound): the 9 neighbours of each pixel
-// (offset, or -1 if not updating) are found once, then a thread reads its channels' 4 features of each updating
-// neighbour (16-byte loads; the threads of a pixel read its 4C features contiguously); the sums go through shared
-// memory so that dx is written by rows.
-constexpr int ADJ_PIX = 32, ADJ_ROWS = NCA_ADJ_ROWS;
+// updating pixels' dp (pixel-major, (N, H, W, 4C); not written elsewhere). A block takes 32 consecutive pixels of an
+// image and all C channels, adj_cpt() channels per thread (more loads in flight per thread; latency-bound): the 9
+// neighbours of each pixel (offset, or -1 if not updating) are found once, then a thread reads its channels' 4
+// features of each updating neighbour (16-byte loads; the threads of a pixel read its 4C features contiguously); the
+// sums go through shared memory so that dx is written by rows.
+constexpr int ADJ_PIX = 32;
 // channels per thread: NCA_ADJ_CPT, except growing NCAs on A100-class GPUs (4: mostly dead pixels, fewer threads per
-// pixel and more blocks in flight; 130 vs 192 us at 5 % alive, texture NCAs prefer 2)
+// pixel and more blocks in flight; 130 vs 192 us at 5 % alive; texture NCAs prefer 2: 4 gives 365 us instead of 244)
 __host__ __device__ constexpr int adj_cpt(bool alive) { return alive && A100_CLASS ? 4 : NCA_ADJ_CPT; }
 template <int C, bool ALIVE>
-__global__ void __launch_bounds__(ADJ_PIX * ADJ_ROWS * C / adj_cpt(ALIVE)) adjoint_kernel(const float *__restrict__ dp, const uint8_t *__restrict__ updating,
-                                                                                        const float *__restrict__ gy, const uint8_t *__restrict__ alive,
-                                                                                        float *__restrict__ gx, int H, int W)  // grid (ceil(W / 32) ceil(H / ADJ_ROWS), images)
+__global__ void __launch_bounds__(ADJ_PIX * C / adj_cpt(ALIVE)) adjoint_kernel(const float *__restrict__ dp, const uint8_t *__restrict__ updating,
+                                                                             const float *__restrict__ gy, const uint8_t *__restrict__ alive,
+                                                                             float *__restrict__ gx, int H, int W)  // grid (pixels / 32, images)
 {
     constexpr int ADJ_CPT = adj_cpt(ALIVE);
     static_assert(C % ADJ_CPT == 0, "channels per thread");
-    constexpr int TPP = C / ADJ_CPT, PIX = ADJ_PIX * ADJ_ROWS, THREADS = PIX * TPP;  // threads per pixel, pixels per block
-    __shared__ int nb[9][PIX];
-    __shared__ float sum[C][PIX + 1];
-    const size_t n = blockIdx.y, plane = (size_t)H * W;
-    const int cols = (W + ADJ_PIX - 1) / ADJ_PIX, Y0 = (blockIdx.x / cols) * ADJ_ROWS, X0 = (blockIdx.x % cols) * ADJ_PIX;
+    constexpr int TPP = C / ADJ_CPT, THREADS = ADJ_PIX * TPP;  // threads per pixel
+    __shared__ int nb[9][ADJ_PIX];
+    __shared__ float sum[C][ADJ_PIX + 1];
+    const size_t n = blockIdx.y, plane = (size_t)H * W, P0 = blockIdx.x * (size_t)ADJ_PIX;
     const float *dpn = dp + n * plane * 4 * C;
-    for (int e = threadIdx.x; e < 9 * PIX; e += THREADS) {  // neighbour j = (dy, dx) of pixel i: its offset in the image if it updates, else -1
-        const int j = e / PIX, i = e % PIX, Y = Y0 + i / ADJ_PIX, X = X0 + i % ADJ_PIX;
+    for (int e = threadIdx.x; e < 9 * ADJ_PIX; e += THREADS) {  // neighbour j = (dy, dx) of pixel i: its offset in the image if it updates, else -1
+        const int j = e / ADJ_PIX, i = e % ADJ_PIX, P = P0 + i;
         int q = -1;
-        if (Y < H && X < W) {
-            q = wrap(Y + 1 - j / 3, H) * W + wrap(X + 1 - j % 3, W);
+        if (P < plane) {
+            q = wrap(P / W + 1 - j / 3, H) * W + wrap(P % W + 1 - j % 3, W);
             q = updating[n * plane + q] ? q : -1;
         }
         nb[j][i] = q;
@@ -1190,10 +1203,11 @@ __global__ void __launch_bounds__(ADJ_PIX * ADJ_ROWS * C / adj_cpt(ALIVE)) adjoi
             sum[c0 + cc][i] = v[cc];
     }
     __syncthreads();
-    for (int e = threadIdx.x; e < C * PIX; e += THREADS) {
-        const int i = e % PIX, c = e / PIX, Y = Y0 + i / ADJ_PIX, X = X0 + i % ADJ_PIX;
-        if (Y < H && X < W) {
-            const size_t P = (size_t)Y * W + X, o = (n * C + c) * plane + P;
+    for (int e = threadIdx.x; e < C * ADJ_PIX; e += THREADS) {
+        const int i = e % ADJ_PIX, c = e / ADJ_PIX;
+        const size_t P = P0 + i;
+        if (P < plane) {
+            const size_t o = (n * C + c) * plane + P;
             gx[o] = (ALIVE && !alive[n * plane + P] ? 0.f : gy[o]) + sum[c][i];
         }
     }

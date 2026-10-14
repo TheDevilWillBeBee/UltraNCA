@@ -59,7 +59,7 @@ Default schedule (`config.yml`):
 
 This is the batch-2 point of a batch-size study at a fixed sample budget. It came within about 3 % of the original 1500-iteration batch-4 schedule when started from a good (decoder-predicted) initialisation. From a **random** init (the default here), a longer schedule may be needed for full quality. That does not matter for speed work.
 
-## What was done (sections 1–3 and the A100 check: one A100 80 GB; section 5: RTX 4090)
+## What was done (sections 1–3 and the A100 check: one A100 80 GB; sections 5–6: RTX 4090; section 7: A100 tuning)
 
 ### 1. Batching NCAs on different targets
 
@@ -115,7 +115,7 @@ All matmuls use `mma.sync.m16n8k8` TF32; a warp computes 16 pixels at a time (th
 
 The backward and adjoint run in chunks of images on two streams so that dp stays in L2: a chunk's backward is about two thirds of a wave of resident blocks (room for the other stream's adjoint); growing NCAs, whose blocks mostly have nothing to do, use at least N / 4 images per chunk. Inference (`nca_ops.rollout`) loops over steps in C++.
 
-**Per-GPU configuration.** The top of `nca_step.cuh` has one hardware constant, `NCA_SMEM_PER_SM_KB` (shared memory per SM: A100 164, RTX 30xx / 40xx 100, H100 228), which `build.sh` sets from the compute capability of the machine's GPU. Blocks per SM (forward) and the backward staging layout (one or two parts) derive from it; the L2 size (backward chunks), SM count and occupancy (forward segment length) are queried at run time. The remaining knobs (`NCA_FWD_WARPS`, `NCA_FWD_RING`, `NCA_BWD_TILES_PER_BLOCK`, `NCA_BWD_UNROLL`, `NCA_BWD_MIN_BLOCKS`, `NCA_ADJ_CPT`) are tuning choices measured on sm_89; on another GPU, rebuild and optionally sweep them, e.g. `bash ncaops/build.sh "-DNCA_FWD_RING=20 -DNCA_BWD_TILES_PER_BLOCK=4"`.
+**Per-GPU configuration.** The top of `nca_step.cuh` has one hardware constant, `NCA_SMEM_PER_SM_KB` (shared memory per SM: A100 164, RTX 30xx / 40xx 100, H100 228), which `build.sh` sets from the compute capability of the machine's GPU. Blocks per SM (forward) and the backward staging layout (one or two parts) derive from it; the L2 size (backward chunks), SM count and occupancy (forward segment length) are queried at run time. The remaining knobs (`NCA_FWD_WARPS`, `NCA_FWD_RING`, `NCA_BWD_TILES_PER_BLOCK`, `NCA_BWD_UNROLL`, `NCA_BWD_MIN_BLOCKS`, `NCA_ADJ_CPT`, `NCA_FWD_MIN_BLOCKS`, `NCA_FWD_TAIL`, `NCA_BWD_TILE_ROWS`, `NCA_BWD_HPARTS`) are tuning choices measured on sm_89, with A100-specific values behind `NCA_A100_CLASS` (164 KB or more per SM; section 7); on another GPU, rebuild and optionally sweep them, e.g. `bash ncaops/build.sh "-DNCA_FWD_RING=20 -DNCA_BWD_TILES_PER_BLOCK=4"`.
 
 Correctness (`ncaops/testing/test_nca.py`, against PyTorch autograd with the same mask, for both sizes, update rate 0.5 / 1, texture / growing, partial tiles; also determinism, chunked backward and rollout = repeated steps):
 
@@ -190,10 +190,64 @@ The texture step gained less than its kernels: the adjoint used to run largely i
 - a 240-register cap on the backward so that small adjoint blocks can co-reside (one block per SM is far too little memory parallelism), streaming cache hints on the backward's x / gy loads (the halo rows are re-read by the next tile row), 16 tiles per block (backward +13, reduce −23 µs), 7-row tiles (all four warps busy in one round: −2–3 % on texture, within the noise, and +6 % on growing);
 - OT loss: cuDNN 9.2 runs a `convertTensor` pass (TF32 rounding of the input) before every TF32 convolution and its gradient, 3.9 of the 40 ms; `cudnn.benchmark`, `allow_tf32 = False`, inductor's Triton convolutions (`max-autotune`) and the input gradient as a forward convolution with the transposed weights are no faster.
 
+### 7. A100 (2026-10-15)
+
+One A100-SXM4 80 GB (108 SMs at 1.41 GHz, 164 KB of shared memory per SM, 40 MB L2), CUDA 12.6, PyTorch 2.14. `build.sh` sets `NCA_SMEM_PER_SM_KB=164`; everything below is conditional on that (`NCA_A100_CLASS` in `nca_step.cuh`) or on a run-time check of the shared memory per SM (`chunk_images()`), so the sm_89 configuration is unchanged. Nsight Compute could not read the hardware counters on this machine (`ERR_NVGPUCTRPERM`, even as root), so the kernels were taken apart by experiment: ablation builds (`NCA_ABLATE` bits: no weight gradients, no dp stores, weight fragments made up in registers, dp stores all to one record, no barriers around the dW2 phase), the torch profiler's kernel times, and A/B builds of every knob. One lesson: a build running on the CPU during a timing run inflates the step time by up to 15 % (the host enqueue slows down and the GPU idles); the numbers here were taken with an idle CPU, interleaving the two builds.
+
+Per step, K = 32, B = 2, 128², update rate 0.5, forward + backward of a 32-step rollout (µs; growing NCAs with trained weights, states grown 64 steps from the seed = 5 % alive cells, or 256 steps = 30 %):
+
+| | sm_89 configuration on the A100 | A100 configuration | RTX 4090 (section 6) |
+|---|---|---|---|
+| texture 12/96, step | 1296 | **1165** | 834–856 |
+| texture kernels: forward / backward / adjoint / reduce + pack | 204 / 692 / 246 / 38 | 203 / 659 / 246 / 38 | 146 / ~500 / ~220 / ~50 |
+| growing 16/128, 5 % alive, step | 939 | **629** | 611–646 |
+| growing kernels: forward / alive / backward / adjoint / reduce + pack | 290 / 55 / 306 / 192 / 40 | 147 / 54 / 236 / 135 / 40 | 248 / – / ~270 / ~70 / 18 |
+| growing 16/128, 30 % alive, step | 1374 | **1085** | – |
+| forward only, texture / growing (5 %) | 205 / 290 | 204 / 202 | – |
+
+The A100 has 2.1× fewer SM-cycles than the 4090 (108 × 1.41 vs 128 × 2.52 GHz) and its texture step is 1.4× slower; per SM-cycle it is the more efficient of the two. Both are register-file bound (64 K registers per SM): the backward runs at 8 warps per SM (255 registers), the forward at 16, and with 4× faster TF32 MMAs per SM-cycle the A100 kernels are even more latency-bound than on the 4090 (texture backward: 16 % of the TF32 peak).
+
+**Configuration chosen** (all measured; the knob names are those of `nca_step.cuh` / `nca_cuda.cu`):
+1. **Forward 16/128 at one block per SM.** On 164 KB two of its blocks fit, which capped the kernel at 128 registers with 264 bytes of spills; one block at 193 registers is twice as fast (growing forward 290 → 147 µs; growing inference 47 → 35 ms for K = 32 at 128² × 256 steps, 96 → 81 ms for one NCA at 2048²). `fwd_min_blocks()` now asks for two blocks only when a group's accumulators fit the 128-register budget (HID / 2 + 2 C ≤ 72: 12/96 yes, 16/128 no); on the 4090 nothing changes (16/128 was at one block there because two do not fit 100 KB). 12/96 at one block is 36 % slower.
+2. **Forward split tail** (`NCA_FWD_TAIL`): 512 blocks on 216 slots are 2.4 waves; the items of the last partial wave run as two half-height blocks each (2.5 % faster forward on both tasks). Shorter segments for everyone were slower (texture: 64 rows +4 %, 32 rows +42 %).
+3. **Backward `NCA_BWD_UNROLL` 6** (texture backward 688 → 659 µs; 3, 4 and 12 are not better; 7-row tiles alone gain 3 % but add nothing on top of unroll 6, `NCA_BWD_TILE_ROWS` stays 6).
+4. **Growing backward: dead tiles load nothing.** The alive map (3 sectors per tile) is read before the x tile, which is fetched only if a pixel updates: 306 → 240 µs at 5 % alive, 555 → 523 at 30 % (on sm_89 the tile loads still overlap the mask computation; the change is probably good there too but was not measured).
+5. **Growing adjoint: 4 channels per thread** (`adj_cpt()`: 192 → 130 µs at 5 % alive, 233 → 210 at 30 %; fewer threads per mostly dead pixel, more blocks in flight). Texture stays at 2: 4 gives 365 µs instead of 244, 1 gives 297.
+6. **One launch of the backward and adjoint** (`chunk_images()` returns N): chunks of 12–24 texture images on the two streams give 1170–1245 µs per step against 1162 for one launch, chunks that keep dp in L2 run serially on one stream are all slower (4–16 images: 1400–1900), and growing chunks of 10 images cost 10 %. (On the 4090 the chunks gain 15–20 %; the A100 kernels stretch each other when they share the SMs.)
+7. **16/128 backward with relu(h) / dh staged in one part** (automatic from the 164 KB; two parts, which leave more L1, are 10 % slower).
+
+Texture backward, where the time goes (688 µs, sm_89 configuration; `NCA_ABLATE`): the weight gradients 205 µs, the dp stores 144 (102 of them the DRAM write traffic of 100 MB per step, the rest the instructions), the weight-fragment loads 132, the rest (perception, h, dh, dp MMAs, staging, tile loads, barriers) 410. The fragment loads are not L1-capacity misses: a 28 KB L1 instead of 92 KB (shared-memory carveout forced to 164 KB) costs only 3.5 %, so the 8-warp block with the fragments resident in shared memory ("Planned next steps" item 1) was not built; the barriers around the dW2 phase cost 10 µs, so merging the weight-gradient phases (a separate dh buffer fits on 164 KB) was dropped too.
+
+**What did not help** (A100, all measured):
+- 3 backward blocks per SM (`NCA_BWD_MIN_BLOCKS=3`, 168 registers with 20 bytes of spills): texture +12 %, growing +42 % (three blocks also leave 16 KB of L1);
+- 4 or 16 backward tiles per block (16: backward +70 µs for a 10 µs cheaper reduce);
+- a 42-row forward ring, a forward segment override (`NCA_FWD_SEG` env, removed);
+- adjoint variants: 1 channel per thread (texture +22 %), 2-D patches of 2 or 4 rows per block (+8 to +36 %), the patch's dp records staged in shared memory with coalesced loads (texture equal at 2 rows, growing +14 %; the kernel is latency- and occupancy-bound, not L1-bound);
+- evict-first (`__stcs`) dp stores (no change);
+- the serial-chunk and carveout experiments above (env knobs, removed);
+- `NCA_BWD_HPARTS=2` for 16/128 (+10 %).
+
+`benchmark.py` and `train.py` (K = 32, the usual schedules), A100, sm_89 configuration → A100 configuration:
+
+| | before | after |
+|---|---|---|
+| `benchmark.py train` texture, ms per iteration (OT loss about 27 ms of it) | 110.4 | 101.6 (K = 64: 193.9) |
+| `benchmark.py train` growing, ms per iteration | 64.9 | 43.2 (K = 64: 80.4) |
+| `train.py` texture / growing, s per NCA (32 targets, compilation excluded) | 2.6 / 2.5 | 2.4 / 2.1 |
+| inference K = 32, 128², 256 steps, texture / growing (ms) | 30.0 / 47.4 | 29.9 / 35.0 |
+| inference 1 NCA, 2048², 256 steps, texture / growing (ms) | 195.7 / 96.3 | 190.0 / 81.2 (1024²: 52.5 / 51.2 → 51.7 / 31.6) |
+| `test_nca.py --bench` 64-step texture rollout fwd+bwd / 80-step growing (B = 8, 72²) | 82.8 / 192.8 | 74.4 / 174.4 |
+
+Quality (final losses of `train.py` on the first 32 textures / 32 emojis, seed 0, A100 configuration vs the sm_89 one on the same GPU): the 32 growing NCAs end with bitwise identical losses (the kernels compute the same values in the same order; the changes only move work between blocks and launches); the textures have a median loss ratio of 1.0003 (mean 1.0003, per texture 0.945–1.047), which is the run-to-run noise of the OT loss (its `scatter_add_` and cuDNN are not bitwise deterministic: two runs of the unmodified kernels differ by the same amount, median ratio 0.997, per texture 0.934–1.049).
+
+The OT loss was not touched: it is about 27 ms of a texture iteration on the A100 (`benchmark.py train` minus 64 steps: 25 % of the iteration; 40 ms and 40 % on the 4090).
+
+`test_nca.py`: one 16/128 growing case at update rate 1 has a cell whose new alpha is 0.100131 in fp32 and falls below the alive threshold under TF32 rounding on the A100, taking its 8 neighbours with it (relative error 1.5e-2 against the 1e-2 bound). Such alive flips are now excluded from the forward error and counted instead (at most 32 per case; the error without them is 3.9e-4).
+
 ## Planned next steps (in rough order of expected gain)
 
-1. **Backward occupancy / latency**: 255 registers and ~47 KB of shared memory per 4-warp block give 8 warps per SM, and the kernel issues every 9 cycles per warp (stalls: tensor pipe 2.4, weight-fragment loads 2.0, dependencies 1.7, barriers 1.6 cycles per instruction). On the A100 / H100 (164 / 228 KB), an 8-warp block of two 4-warp teams with the weight fragments resident in shared memory (~140 KB) would remove the fragment-load stalls; it does not fit 100 KB. Tried and dropped: two warps per pixel group (8-warp blocks at 128 registers, 16 warps per SM): twice the instructions per MMA, 15–30 % slower; a 168-register cap (spills).
-2. **Fusing the adjoint** stays a loss on 100 KB GPUs (see above); with 164 KB or more, the gather could stage a tile's dp in shared memory instead of reading it 9 times from L2.
+1. **Backward occupancy / latency**: 255 registers and ~47 KB of shared memory per 4-warp block give 8 warps per SM, and the kernel issues every 9 cycles per warp (stalls: tensor pipe 2.4, weight-fragment loads 2.0, dependencies 1.7, barriers 1.6 cycles per instruction). On the A100 / H100 (164 / 228 KB), an 8-warp block of two 4-warp teams with the weight fragments resident in shared memory (~140 KB) would remove the fragment-load stalls; it does not fit 100 KB. Tried and dropped: two warps per pixel group (8-warp blocks at 128 registers, 16 warps per SM): twice the instructions per MMA, 15–30 % slower; a 168-register cap (spills). A100 (section 7): the fragment loads cost 132 of 688 µs but are not L1 misses (a 28 KB L1 costs 3.5 %), so shared-memory residency would save little; the 168-register cap with 3 blocks per SM is 12 % slower.
+2. **Fusing the adjoint** stays a loss on 100 KB GPUs (see above); with 164 KB or more, the gather could stage a tile's dp in shared memory instead of reading it 9 times from L2. A100 (section 7): a standalone adjoint that stages the patch's records in shared memory was no faster (the kernel is latency- and occupancy-bound), and the fused version would also recompute the halo rows.
 3. **OT loss** (40 ms of a 93 ms texture iteration): the max-pool backward reads int64 indices (2.5 ms; a backward that recomputes the argmax from the saved input would halve it), the gradient of the 1024 sampled feature positions is materialized as a dense scatter per layer (~1 ms), and the cuDNN TF32 conversion passes (3.9 ms) would only go away with a different convolution implementation; bf16 VGG (validated, opt-in) halves the whole loss.
 4. **Sparse growing grids**: skip the zero writes of dead cells (e.g. track the live bounding box) for very large, mostly empty grids.
 5. **Other GPUs**: H100 `wgmma`; other (C, HID) instantiations (`dispatch()` in `nca_cuda.cu`; C a multiple of 4, HID a multiple of 32).
