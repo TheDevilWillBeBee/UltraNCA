@@ -11,57 +11,76 @@ FILTERS = torch.stack([torch.tensor([[0., 0, 0], [0, 1, 0], [0, 0, 0]]), torch.t
                        torch.tensor([[-1., -2, -1], [0, 0, 0], [1, 2, 1]]), torch.tensor([[1., 2, 1], [2, -12, 2], [1, 2, 1]])])[:, None]
 
 
-def reference_step(x, w1, b1, w2, mask):
+def alive(x):  # GrowingNCA.get_living_mask: x (K, B, C, H, W) -> (K, B, 1, H, W)
+    K, B, C, H, W = x.shape
+    return (F.max_pool2d(x[:, :, 3].reshape(K * B, 1, H, W), 3, 1, 1) > 0.1).reshape(K, B, 1, H, W)
+
+
+def reference_step(x, w1, b1, w2, mask, growing=False):
     """x (K, B, C, H, W), mask (K, B, 1, H, W)."""
     K, B, C, H, W = x.shape
     p = F.conv2d(F.pad(x.reshape(-1, 1, H, W), (1, 1, 1, 1), mode='circular'), FILTERS.to(x)).reshape(K, B, 4 * C, H * W)
     h = torch.relu(w1[:, None] @ p + b1[:, None, :, None])
-    return x + (w2[:, None] @ h).reshape(K, B, C, H, W) * mask
+    y = x + (w2[:, None] @ h).reshape(K, B, C, H, W) * mask
+    return y * (alive(x) & alive(y)) if growing else y
 
 
 def rel(a, b):
     return ((a - b).norm() / b.norm()).item()
 
 
-def make(K, B, C=12, HID=96, H=128, W=128, seed=0):
+def make(K, B, C=12, HID=96, H=128, W=128, seed=0, growing=False):
     g = torch.Generator(device='cuda').manual_seed(seed)
     x = 0.3 * torch.randn(K, B, C, H, W, device='cuda', generator=g)
+    if growing:  # a living disc in a dead (zero) background
+        yy, xx = torch.meshgrid(torch.arange(H, device='cuda') - H / 2, torch.arange(W, device='cuda') - W / 2, indexing='ij')
+        x = x * (yy ** 2 + xx ** 2 < (min(H, W) / 3) ** 2)
     w1 = 0.1 * torch.randn(K, HID, 4 * C, device='cuda', generator=g)
     b1 = 0.05 * torch.randn(K, HID, device='cuda', generator=g)
     w2 = 0.05 * torch.randn(K, C, HID, device='cuda', generator=g)
     return x, w1, b1, w2
 
 
+CASES = [(C, HID, rate, growing) for C, HID in ((12, 96), (16, 128)) for rate in (0.5, 1.0) for growing in (False, True)]
+
+
+def name(C, HID, rate, growing, fp32):
+    return f'{C}/{HID} rate={rate} {"growing" if growing else "texture"} {"fp32" if fp32 else "tf32"}'
+
+
+def mask_for(K, B, H, W, seed, rate):
+    return nca_ops.update_mask(K * B, H, W, seed, rate).view(K, B, 1, H, W)
+
+
 def test_forward():
     torch.backends.cuda.matmul.allow_tf32 = False; torch.backends.cudnn.allow_tf32 = False
-    for K, B, H, W in ((3, 2, 128, 128), (2, 3, 37, 50), (1, 1, 8, 16)):  # also partial tiles
-        x, w1, b1, w2 = make(K, B, H=H, W=W)
-        seed = 1234
-        mask = nca_ops.update_mask(K * B, H, W, seed, 0.5).view(K, B, 1, H, W)
-        ref = reference_step(x, w1, b1, w2, mask)
-        for fp32 in (True, False):
-            y = nca_ops.step(x, w1, b1, w2, 0.5, fp32=fp32, seed=seed)
-            print(f'forward K={K} B={B} {H}x{W} {"fp32 (3xTF32)" if fp32 else "tf32"}: relative error {rel(y, ref):.1e}')
+    for C, HID, rate, growing in CASES:
+        for K, B, H, W in ((3, 2, 128, 128), (2, 3, 37, 50), (1, 1, 8, 16)):  # also partial tiles
+            x, w1, b1, w2 = make(K, B, C, HID, H, W, growing=growing)
+            ref = reference_step(x, w1, b1, w2, mask_for(K, B, H, W, 1234, rate), growing)
+            for fp32 in (True, False):
+                y = nca_ops.step(x, w1, b1, w2, rate, growing, fp32=fp32, seed=1234)
+                print(f'forward {name(C, HID, rate, growing, fp32)} K={K} B={B} {H}x{W}: relative error {rel(y, ref):.1e}')
     m = nca_ops.update_mask(4, 128, 128, 7, 0.5)
     print(f'mask: mean {m.mean().item():.4f} (expect 0.5), values {sorted(m.unique().tolist())}')
 
 
 def test_backward():
     torch.backends.cuda.matmul.allow_tf32 = False; torch.backends.cudnn.allow_tf32 = False
-    for K, B, H, W in ((3, 2, 64, 64), (2, 3, 37, 50)):
-        x, w1, b1, w2 = make(K, B, H=H, W=W)
-        R = torch.randn_like(x)
-        seed = 99
-        mask = nca_ops.update_mask(K * B, H, W, seed, 0.5).view(K, B, 1, H, W)
-        params = [t.clone().requires_grad_() for t in (x, w1, b1, w2)]
-        ref = torch.autograd.grad((reference_step(*params, mask) * R).sum(), params)
-        for fp32 in (True, False):
+    for C, HID, rate, growing in CASES:
+        for K, B, H, W in ((3, 2, 64, 64), (2, 3, 37, 50)):
+            x, w1, b1, w2 = make(K, B, C, HID, H, W, growing=growing)
+            R = torch.randn_like(x)
+            mask = mask_for(K, B, H, W, 99, rate)
             params = [t.clone().requires_grad_() for t in (x, w1, b1, w2)]
-            out = torch.autograd.grad((nca_ops.step(*params, 0.5, fp32=fp32, seed=seed) * R).sum(), params)
-            errs = ' '.join(f'{n} {rel(a, b):.1e}' for n, a, b in zip(('dx', 'dw1', 'db1', 'dw2'), out, ref))
-            print(f'backward K={K} B={B} {H}x{W} {"fp32 (3xTF32)" if fp32 else "tf32"}: relative error {errs}')
-        out2 = torch.autograd.grad((nca_ops.step(*params, 0.5, seed=seed) * R).sum(), params)
-        print('  deterministic (two tf32 runs bitwise equal):', all(torch.equal(a, b) for a, b in zip(out, out2)))
+            ref = torch.autograd.grad((reference_step(*params, mask, growing) * R).sum(), params)
+            for fp32 in (True, False):
+                params = [t.clone().requires_grad_() for t in (x, w1, b1, w2)]
+                out = torch.autograd.grad((nca_ops.step(*params, rate, growing, fp32=fp32, seed=99) * R).sum(), params)
+                errs = ' '.join(f'{n} {rel(a, b):.1e}' for n, a, b in zip(('dx', 'dw1', 'db1', 'dw2'), out, ref))
+                print(f'backward {name(C, HID, rate, growing, fp32)} K={K} B={B} {H}x{W}: relative error {errs}')
+            out2 = torch.autograd.grad((nca_ops.step(*params, rate, growing, seed=99) * R).sum(), params)
+            print('  deterministic (two tf32 runs bitwise equal):', all(torch.equal(a, b) for a, b in zip(out, out2)))
 
 
 def bench(quick=False):

@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 #include <utility>
+#include <type_traits>
 #include <nanobind/stl/pair.h>
 #include "nca_step.cuh"
 
@@ -16,6 +17,7 @@ using FloatArray3D = nb::ndarray<float, nb::shape<-1, -1, -1>, nb::c_contig, nb:
 using FloatArray1D = nb::ndarray<float, nb::shape<-1>, nb::c_contig, nb::device::cuda>;
 using FloatArray4D = nb::ndarray<float, nb::shape<-1, -1, -1, -1>, nb::c_contig, nb::device::cuda>;
 using ByteArray1D = nb::ndarray<uint8_t, nb::shape<-1>, nb::c_contig, nb::device::cuda>;
+using ByteArray3D = nb::ndarray<uint8_t, nb::shape<-1, -1, -1>, nb::c_contig, nb::device::cuda>;
 
 #define cuda_check(call)                                                              \
     do                                                                                \
@@ -49,20 +51,28 @@ void validate_array_shape(const ArrayType &array, const std::vector<size_t> &exp
 }
 
 // Compile-time NCA configuration handed to generic lambdas by dispatch().
-template <int C_, int HID_, bool FP32_>
+template <int C_, int HID_, bool FP32_, bool STOCH_, bool ALIVE_>
 struct Inst
 {
     static constexpr int C = C_, HID = HID_;
-    static constexpr bool FP32 = FP32_;
+    static constexpr bool FP32 = FP32_, STOCH = STOCH_, ALIVE = ALIVE_;
 };
 
-// (channels, hidden) instantiations; add a line here for another NCA size.
 template <typename F>
-auto dispatch(size_t C, size_t HID, bool fp32, F &&f)
+auto with_bool(bool v, F &&f) { return v ? f(std::true_type{}) : f(std::false_type{}); }
+
+// (channels, hidden) instantiations, each with every (fp32, stochastic, alive) combination; add a line here for
+// another NCA size.
+template <typename F>
+auto dispatch(size_t C, size_t HID, bool fp32, bool stoch, bool alive, F &&f)
 {
-    if (C == 12 && HID == 96)
-        return fp32 ? f(Inst<12, 96, true>{}) : f(Inst<12, 96, false>{});
-    throw std::runtime_error("no kernel instantiated for channels=" + std::to_string(C) + ", hidden=" + std::to_string(HID));
+    return with_bool(fp32, [&](auto FP) { return with_bool(stoch, [&](auto ST) { return with_bool(alive, [&](auto AL) {
+        if (C == 12 && HID == 96)
+            return f(Inst<12, 96, FP, ST, AL>{});
+        if (C == 16 && HID == 128)
+            return f(Inst<16, 128, FP, ST, AL>{});
+        throw std::runtime_error("no kernel instantiated for channels=" + std::to_string(C) + ", hidden=" + std::to_string(HID));
+    }); }); });
 }
 
 template <typename Kernel>
@@ -74,7 +84,8 @@ void set_smem(Kernel kernel, int bytes)
 static int ceil_div(int a, int b) { return (a + b - 1) / b; }
 
 void forward(FloatArray4D x, FloatArray3D w1, FloatArray2D b1, FloatArray3D w2, FloatArray4D y,
-             uint32_t batch_per_nca, uint64_t seed, float update_rate, bool fp32)
+             FloatArray3D alpha, ByteArray3D alive, uint32_t batch_per_nca, uint64_t seed, float update_rate, bool fp32,
+             bool growing)
 {
     const size_t N = x.shape(0), C = x.shape(1), H = x.shape(2), W = x.shape(3), K = w1.shape(0), HID = w1.shape(1);
     if (N != K * batch_per_nca)
@@ -83,15 +94,29 @@ void forward(FloatArray4D x, FloatArray3D w1, FloatArray2D b1, FloatArray3D w2, 
     validate_array_shape(b1, {K, HID}, "b1");
     validate_array_shape(w2, {K, C, HID}, "w2");
     validate_array_shape(y, {N, C, H, W}, "y");
-    dispatch(C, HID, fp32, [&](auto I) {
+    if (growing)
+    {
+        if (C < 4)
+            throw std::runtime_error("a growing NCA needs at least 4 channels (alpha = channel 3)");
+        validate_array_shape(alpha, {N, H, W}, "alpha");
+        validate_array_shape(alive, {N, H, W}, "alive");
+    }
+    dispatch(C, HID, fp32, update_rate < 1.f, growing, [&](auto I) {
         using D = decltype(I);
-        auto kernel = nca_step::forward_kernel<D::C, D::HID, D::FP32>;
+        auto kernel = nca_step::forward_kernel<D::C, D::HID, D::FP32, D::STOCH, D::ALIVE>;
         constexpr int smem = sizeof(nca_step::ForwardSmem<D::C, D::HID, D::FP32>);
         set_smem(kernel, smem);
         const int tiles = ceil_div(W, nca_step::TILE_W) * ceil_div(H, nca_step::TILE_H);
         kernel<<<dim3(ceil_div(tiles, nca_step::TILES_PER_BLOCK), N), nca_step::THREADS, smem>>>(
-            x.data(), w1.data(), b1.data(), w2.data(), y.data(), batch_per_nca, H, W, seed, update_rate);
+            x.data(), w1.data(), b1.data(), w2.data(), y.data(), alpha.data(), batch_per_nca, H, W, seed, update_rate);
         cuda_check(cudaGetLastError());
+        if constexpr (D::ALIVE)
+        {
+            const uint64_t total = (uint64_t)N * H * W;
+            nca_step::alive_kernel<D::C><<<(unsigned)((total + 255) / 256), 256>>>(x.data(), alpha.data(), y.data(),
+                                                                                   alive.data(), H, W, total);
+            cuda_check(cudaGetLastError());
+        }
     });
 }
 
@@ -104,17 +129,17 @@ static int backward_blocks_per_image(int H, int W)
 // Workspace sizes for backward(): (packed weight bytes per NCA, partial floats per image).
 std::pair<size_t, size_t> backward_workspace(size_t C, size_t HID, bool fp32, size_t H, size_t W)
 {
-    return dispatch(C, HID, fp32, [&](auto I) {
+    return dispatch(C, HID, fp32, false, false, [&](auto I) {
         using D = decltype(I);
         return std::make_pair(sizeof(nca_step::BackwardWeights<D::C, D::HID, D::FP32>),
                               (size_t)backward_blocks_per_image(H, W) * nca_step::BwdShape<D::C, D::HID>::PARTIAL);
     });
 }
 
-void backward(FloatArray4D x, FloatArray4D gy, FloatArray3D w1, FloatArray2D b1, FloatArray3D w2,
+void backward(FloatArray4D x, FloatArray4D gy, ByteArray3D alive, FloatArray3D w1, FloatArray2D b1, FloatArray3D w2,
               FloatArray4D gx, FloatArray3D dw1, FloatArray2D db1, FloatArray3D dw2,
               ByteArray1D packed, FloatArray4D dp, FloatArray1D partial,
-              uint32_t batch_per_nca, uint64_t seed, float update_rate, bool fp32)
+              uint32_t batch_per_nca, uint64_t seed, float update_rate, bool fp32, bool growing)
 {
     const size_t N = x.shape(0), C = x.shape(1), H = x.shape(2), W = x.shape(3), K = w1.shape(0), HID = w1.shape(1);
     if (N != K * batch_per_nca)
@@ -131,7 +156,9 @@ void backward(FloatArray4D x, FloatArray4D gy, FloatArray3D w1, FloatArray2D b1,
     const auto [packed_bytes, partial_floats] = backward_workspace(C, HID, fp32, H, W);
     validate_array_shape(packed, {K * packed_bytes}, "packed");
     validate_array_shape(partial, {N * partial_floats}, "partial");
-    dispatch(C, HID, fp32, [&](auto I) {
+    if (growing)
+        validate_array_shape(alive, {N, H, W}, "alive");
+    dispatch(C, HID, fp32, update_rate < 1.f, growing, [&](auto I) {
         using D = decltype(I);
         using BW = nca_step::BackwardWeights<D::C, D::HID, D::FP32>;
         using BS = nca_step::BwdShape<D::C, D::HID>;
@@ -139,12 +166,12 @@ void backward(FloatArray4D x, FloatArray4D gy, FloatArray3D w1, FloatArray2D b1,
         nca_step::pack_kernel<D::C, D::HID, D::FP32><<<K, 256>>>(w1.data(), b1.data(), w2.data(), pk);
         cuda_check(cudaGetLastError());
 
-        auto kernel = nca_step::backward_kernel<D::C, D::HID, D::FP32>;
+        auto kernel = nca_step::backward_kernel<D::C, D::HID, D::FP32, D::STOCH, D::ALIVE>;
         constexpr int smem = sizeof(nca_step::BackwardSmem<D::C, D::HID>);
         set_smem(kernel, smem);
         const int blocks = backward_blocks_per_image(H, W);
-        kernel<<<dim3(blocks, N), nca_step::THREADS, smem>>>(x.data(), gy.data(), pk, dp.data(), partial.data(),
-                                                            batch_per_nca, H, W, seed, update_rate);
+        kernel<<<dim3(blocks, N), nca_step::THREADS, smem>>>(x.data(), gy.data(), alive.data(), pk, dp.data(),
+                                                            partial.data(), batch_per_nca, H, W, seed, update_rate);
         cuda_check(cudaGetLastError());
 
         nca_step::reduce_kernel<D::C, D::HID><<<dim3(ceil_div(BS::PARTIAL, 256), K), 256>>>(
@@ -152,7 +179,8 @@ void backward(FloatArray4D x, FloatArray4D gy, FloatArray3D w1, FloatArray2D b1,
         cuda_check(cudaGetLastError());
 
         const uint64_t total = (uint64_t)N * D::C * H * W;
-        nca_step::adjoint_kernel<D::C><<<(unsigned)((total + 255) / 256), 256>>>(dp.data(), gy.data(), gx.data(), H, W, total);
+        nca_step::adjoint_kernel<D::C, D::ALIVE><<<(unsigned)((total + 255) / 256), 256>>>(dp.data(), gy.data(), alive.data(),
+                                                                                           gx.data(), H, W, total);
         cuda_check(cudaGetLastError());
     });
 }
@@ -166,14 +194,17 @@ void update_mask(FloatArray3D mask, uint64_t seed, float update_rate)
 
 NB_MODULE(nca_cuda, m)
 {
-    m.def("forward", &forward, "x"_a, "w1"_a, "b1"_a, "w2"_a, "y"_a, "batch_per_nca"_a, "seed"_a, "update_rate"_a, "fp32"_a,
+    m.def("forward", &forward, "x"_a, "w1"_a, "b1"_a, "w2"_a, "y"_a, "alpha"_a, "alive"_a, "batch_per_nca"_a, "seed"_a,
+          "update_rate"_a, "fp32"_a, "growing"_a,
           "One NCA step. x, y: (N, C, H, W) with N = K * batch_per_nca; w1: (K, hidden, 4C); b1: (K, hidden); "
-          "w2: (K, C, hidden). fp32=False uses TF32 tensor cores, fp32=True 3xTF32 (fp32 accuracy).");
+          "w2: (K, C, hidden). fp32=False uses TF32 tensor cores, fp32=True 3xTF32 (fp32 accuracy). update_rate >= 1: "
+          "every cell updates. growing: alive masking (alpha = channel 3); alpha (N, H, W) is a workspace and alive "
+          "(N, H, W) receives the mask for backward() (both unused otherwise).");
     m.def("backward_workspace", &backward_workspace, "channels"_a, "hidden"_a, "fp32"_a, "H"_a, "W"_a,
           "(packed weight bytes per NCA, partial floats per image) for backward().");
-    m.def("backward", &backward, "x"_a, "gy"_a, "w1"_a, "b1"_a, "w2"_a, "gx"_a, "dw1"_a, "db1"_a, "dw2"_a,
-          "packed"_a, "dp"_a, "partial"_a, "batch_per_nca"_a, "seed"_a, "update_rate"_a, "fp32"_a,
-          "Gradients of one NCA step (same seed as the forward). Writes gx, dw1, db1, dw2; packed, dp (N, 4C, H, W) "
+    m.def("backward", &backward, "x"_a, "gy"_a, "alive"_a, "w1"_a, "b1"_a, "w2"_a, "gx"_a, "dw1"_a, "db1"_a, "dw2"_a,
+          "packed"_a, "dp"_a, "partial"_a, "batch_per_nca"_a, "seed"_a, "update_rate"_a, "fp32"_a, "growing"_a,
+          "Gradients of one NCA step (same seed, update_rate and, if growing, alive mask as the forward). Writes gx, dw1, db1, dw2; packed, dp (N, 4C, H, W) "
           "and partial are workspaces sized by backward_workspace(). Weight gradients are reduced in a fixed order.");
     m.def("update_mask", &update_mask, "mask"_a, "seed"_a, "update_rate"_a,
           "The stochastic update mask used by forward / backward: mask (N, H, W) = floor(U + update_rate).");

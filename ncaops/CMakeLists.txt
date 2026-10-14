@@ -1,8 +1,8 @@
-cmake_minimum_required(VERSION 3.18...3.27)
+cmake_minimum_required(VERSION 3.24...3.27)
 
-# mma.sync TF32 needs sm_80 or newer
+# the GPU of this machine (mma.sync TF32 needs sm_80 or newer); e.g. -DCMAKE_CUDA_ARCHITECTURES="80;86;89" for others
 if (NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES 80 86 89)
+  set(CMAKE_CUDA_ARCHITECTURES native)
 endif()
 
 project(ncaops LANGUAGES CXX CUDA)

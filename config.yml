@@ -1,3 +1,4 @@
+task: texture                            # texture | growing (config_growing.yml)
 targets: data/pbr_textures              # directory of target images (.png / .jpg), see prepare/download_pbr.py; relative paths are relative to this file
 out_dir: runs/pbr                        # one <image name>.pt (+ .png preview) per target, log.json, config.yml
 # initial weights: null (random: nn.Conv2d default for w1 / b1, zero w2), a .pt shared by all targets, or a directory
@@ -5,6 +6,7 @@ out_dir: runs/pbr                        # one <image name>.pt (+ .png preview) 
 init: null
 img_size: 128
 seed: 0
+preview_steps: 256                       # rollout length of the saved previews
 
 nca:
   channels: 12
