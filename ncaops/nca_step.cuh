@@ -46,6 +46,9 @@ namespace nca_step {
 #ifndef NCA_ADJ_CPT
 #define NCA_ADJ_CPT 2
 #endif
+#ifndef NCA_ADJ_ROWS
+#define NCA_ADJ_ROWS 4
+#endif
 constexpr int TILE_W = 16;                            // pixels per warp row = MMA M; must stay 16
 constexpr int FWD_WARPS = NCA_FWD_WARPS;              // forward: warps per block
 constexpr int FWD_THREADS = 32 * FWD_WARPS;
@@ -639,7 +642,9 @@ __global__ void alive_kernel(const float *__restrict__ x, const float *__restric
                              uint8_t *__restrict__ alive, int H, int W, uint64_t total, bool reuse)
 {
     const uint64_t i = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x;  // n * H * W + Y * W + X
-    if (i >= total)
+    // A clean reused cell was neither live in the destination nor written by the forward. The forward only
+    // skips cells with no old living neighbour, so its new alive bit is also zero.
+    if (i >= total || (reuse && !alive[i]))
         return;
     const int X = i % W, Y = (i / W) % H;
     const uint64_t plane = (uint64_t)H * W, n = i / plane;
@@ -1094,64 +1099,67 @@ __global__ void reduce_kernel(const float *__restrict__ partial, int blocks_per_
         dw2[(size_t)k * C * HID + e - HID * (BS::PIN + 1)] = s;
 }
 
-// dx = g (* a) + sum_o sum_f K_f(o) dp_{4c+f}(y - o), the transpose of the circular perception filters, over the
-// updating pixels' dp (pixel-major, (N, H, W, 4C); not written elsewhere). A block takes 32 consecutive pixels of an
-// image and all C channels, ADJ_CPT channels per thread (more loads in flight per thread; latency-bound): the 9
-// neighbours of each pixel (offset, or -1 if not updating) are found once, then a thread reads its channels' 4
-// features of each updating neighbour (16-byte loads; the threads of a pixel read its 4C features contiguously); the
-// sums go through shared memory so that dx is written by rows.
-constexpr int ADJ_PIX = 32, ADJ_CPT = NCA_ADJ_CPT;
+// dx = g (* a) + sum_o sum_f K_f(o) dp_{4c+f}(y - o), the transpose of the circular perception filters.
+// A block covers ADJ_ROWS x ADJ_PIX pixels and C channels. A thread owns ADJ_CPT channels of a column and reuses
+// each neighbour's float4 across up to three output rows. Descending source rows preserve the original tap order
+// in each output's sum. Neighbour offsets are shared across channels; sums are transposed for row-wise stores.
+constexpr int ADJ_PIX = 32, ADJ_CPT = NCA_ADJ_CPT, ADJ_ROWS = NCA_ADJ_ROWS;
 template <int C, bool ALIVE>
-__global__ void __launch_bounds__(ADJ_PIX * C / ADJ_CPT) adjoint_kernel(const float *__restrict__ dp, const uint8_t *__restrict__ updating,
-                                                                      const float *__restrict__ gy, const uint8_t *__restrict__ alive,
-                                                                      float *__restrict__ gx, int H, int W)  // grid (pixels / 32, images)
+__global__ void adjoint_kernel(const float *__restrict__ dp, const uint8_t *__restrict__ updating,
+                              const float *__restrict__ gy, const uint8_t *__restrict__ alive,
+                              float *__restrict__ gx, int H, int W)
 {
-    static_assert(C % ADJ_CPT == 0, "channels per thread");
-    constexpr int TPP = C / ADJ_CPT, THREADS = ADJ_PIX * TPP;  // threads per pixel
-    __shared__ int nb[9][ADJ_PIX];
-    __shared__ float sum[C][ADJ_PIX + 1];
-    const size_t n = blockIdx.y, plane = (size_t)H * W, P0 = blockIdx.x * (size_t)ADJ_PIX;
-    const float *dpn = dp + n * plane * 4 * C;
-    for (int e = threadIdx.x; e < 9 * ADJ_PIX; e += THREADS) {  // neighbour j = (dy, dx) of pixel i: its offset in the image if it updates, else -1
-        const int j = e / ADJ_PIX, i = e % ADJ_PIX, P = P0 + i;
+    static_assert(C % ADJ_CPT == 0 && ADJ_ROWS > 0, "adjoint tile");
+    constexpr int TPP = C / ADJ_CPT, THREADS = ADJ_PIX * TPP, PIX = ADJ_PIX * ADJ_ROWS;
+    __shared__ int nb[ADJ_ROWS + 2][3][ADJ_PIX];
+    __shared__ float sum[C][PIX + 1];
+    const size_t n = blockIdx.y, plane = (size_t)H * W;
+    const int x0 = blockIdx.x % ((W + ADJ_PIX - 1) / ADJ_PIX) * ADJ_PIX;
+    const int y0 = blockIdx.x / ((W + ADJ_PIX - 1) / ADJ_PIX) * ADJ_ROWS;
+    for (int e = threadIdx.x; e < (ADJ_ROWS + 2) * 3 * ADJ_PIX; e += THREADS) {
+        const int row = e / (3 * ADJ_PIX), j = e / ADJ_PIX % 3, i = e % ADJ_PIX;
         int q = -1;
-        if (P < plane) {
-            q = wrap(P / W + 1 - j / 3, H) * W + wrap(P % W + 1 - j % 3, W);
+        if (x0 + i < W && y0 + row <= H + 1) {
+            q = wrap(y0 + row - 1, H) * W + wrap(x0 + i + 1 - j, W);
             q = updating[n * plane + q] ? q : -1;
         }
-        nb[j][i] = q;
+        nb[row][j][i] = q;
     }
     __syncthreads();
-    {
-        const int c0 = threadIdx.x % TPP * ADJ_CPT, i = threadIdx.x / TPP;
-        float v[ADJ_CPT] = {};
+    const int c0 = threadIdx.x % TPP * ADJ_CPT, i = threadIdx.x / TPP;
+    float v[ADJ_ROWS][ADJ_CPT] = {};
 #pragma unroll
-        for (int j = 0; j < 9; ++j) {
-            const int q = nb[j][i];
+    for (int row = ADJ_ROWS + 1; row >= 0; --row)
+#pragma unroll
+        for (int j = 0; j < 3; ++j) {
+            const int q = nb[row][j][i];
             if (q < 0)
                 continue;
-            const float4 *rec = reinterpret_cast<const float4 *>(dpn + (size_t)q * 4 * C) + c0;
+            const float4 *rec = reinterpret_cast<const float4 *>(dp + (n * plane + q) * 4 * C) + c0;
 #pragma unroll
             for (int cc = 0; cc < ADJ_CPT; ++cc) {
                 const float4 d = __ldg(rec + cc);
                 const float f[4] = {d.x, d.y, d.z, d.w};
 #pragma unroll
-                for (int k = 0; k < 4; ++k)
-                    if (filter_tap(k, j) != 0.f)
-                        v[cc] = fmaf(filter_tap(k, j), f[k], v[cc]);
+                for (int r = 0; r < ADJ_ROWS; ++r)
+                    if (row >= r && row <= r + 2)
+#pragma unroll
+                        for (int k = 0; k < 4; ++k)
+                            if (filter_tap(k, 3 * (r + 2 - row) + j) != 0.f)
+                                v[r][cc] = fmaf(filter_tap(k, 3 * (r + 2 - row) + j), f[k], v[r][cc]);
             }
         }
 #pragma unroll
+    for (int r = 0; r < ADJ_ROWS; ++r)
+#pragma unroll
         for (int cc = 0; cc < ADJ_CPT; ++cc)
-            sum[c0 + cc][i] = v[cc];
-    }
+            sum[c0 + cc][r * ADJ_PIX + i] = v[r][cc];
     __syncthreads();
-    for (int e = threadIdx.x; e < C * ADJ_PIX; e += THREADS) {
-        const int i = e % ADJ_PIX, c = e / ADJ_PIX;
-        const size_t P = P0 + i;
-        if (P < plane) {
-            const size_t o = (n * C + c) * plane + P;
-            gx[o] = (ALIVE && !alive[n * plane + P] ? 0.f : gy[o]) + sum[c][i];
+    for (int e = threadIdx.x; e < C * PIX; e += THREADS) {
+        const int p = e % PIX, c = e / PIX, Y = y0 + p / ADJ_PIX, X = x0 + p % ADJ_PIX;
+        if (Y < H && X < W) {
+            const size_t P = (size_t)Y * W + X, o = (n * C + c) * plane + P;
+            gx[o] = (ALIVE && !alive[n * plane + P] ? 0.f : gy[o]) + sum[c][p];
         }
     }
 }

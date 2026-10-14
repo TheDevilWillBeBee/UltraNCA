@@ -296,7 +296,8 @@ void backward(FloatArray4D x, FloatArray4D gy, ByteArray3D alive, FloatArray3D w
                                                                        updating.data(), partial.data(), n0, batch_per_nca,
                                                                        H, W, seed, update_rate);
             cuda_check(cudaGetLastError());
-            nca_step::adjoint_kernel<D::C, D::ALIVE><<<dim3(ceil_div(H * W, nca_step::ADJ_PIX), n), nca_step::ADJ_PIX * D::C / nca_step::ADJ_CPT, 0, s>>>(
+            const dim3 adj_grid(ceil_div(W, nca_step::ADJ_PIX) * ceil_div(H, nca_step::ADJ_ROWS), n);
+            nca_step::adjoint_kernel<D::C, D::ALIVE><<<adj_grid, nca_step::ADJ_PIX * D::C / nca_step::ADJ_CPT, 0, s>>>(
                 dpc, updating.data() + n0 * plane, gy.data() + n0 * D::C * plane, alive.data() + (growing ? n0 * plane : 0),
                 gx.data() + n0 * D::C * plane, H, W);
             cuda_check(cudaGetLastError());
@@ -328,7 +329,7 @@ NB_MODULE(nca_cuda, m)
           "(N, H, W) receives the mask for backward() (both unused otherwise).");
     m.def("rollout", &rollout, "x"_a, "w1"_a, "b1"_a, "w2"_a, "y"_a, "tmp"_a, "alpha"_a, "alive"_a, "steps"_a,
           "batch_per_nca"_a, "seed"_a, "update_rate"_a, "fp32"_a, "growing"_a, "stream"_a,
-          "`steps` forward steps from x into y (tmp: workspace like x if steps > 1), with the step seeds derived from "
+          "`steps` forward steps from x into y (tmp: workspace like x if steps > 1; growing: alive has shape (2N, H, W)), with the step seeds derived from "
           "`seed`; no gradients.");
     m.def("backward_workspace", &backward_workspace, "channels"_a, "hidden"_a, "fp32"_a, "N"_a, "H"_a, "W"_a, "update_rate"_a,
           "growing"_a, "(packed weight bytes per NCA, partial floats per image, images per dp chunk) for backward().");
