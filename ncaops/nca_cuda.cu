@@ -107,7 +107,7 @@ void forward(FloatArray4D x, FloatArray3D w1, FloatArray2D b1, FloatArray3D w2, 
         constexpr int smem = sizeof(nca_step::ForwardSmem<D::C, D::HID, D::FP32>);
         set_smem(kernel, smem);
         const int tiles = ceil_div(W, nca_step::TILE_W) * ceil_div(H, nca_step::TILE_H);
-        kernel<<<dim3(ceil_div(tiles, nca_step::TILES_PER_BLOCK), N), nca_step::THREADS, smem>>>(
+        kernel<<<dim3(ceil_div(tiles, nca_step::TILES_PER_BLOCK), N), nca_step::FWD_THREADS, smem>>>(
             x.data(), w1.data(), b1.data(), w2.data(), y.data(), alpha.data(), batch_per_nca, H, W, seed, update_rate);
         cuda_check(cudaGetLastError());
         if constexpr (D::ALIVE)
@@ -170,7 +170,7 @@ void backward(FloatArray4D x, FloatArray4D gy, ByteArray3D alive, FloatArray3D w
         constexpr int smem = sizeof(nca_step::BackwardSmem<D::C, D::HID>);
         set_smem(kernel, smem);
         const int blocks = backward_blocks_per_image(H, W);
-        kernel<<<dim3(blocks, N), nca_step::THREADS, smem>>>(x.data(), gy.data(), alive.data(), pk, dp.data(),
+        kernel<<<dim3(blocks, N), nca_step::BWD_THREADS, smem>>>(x.data(), gy.data(), alive.data(), pk, dp.data(),
                                                             partial.data(), batch_per_nca, H, W, seed, update_rate);
         cuda_check(cudaGetLastError());
 
@@ -188,7 +188,8 @@ void backward(FloatArray4D x, FloatArray4D gy, ByteArray3D alive, FloatArray3D w
 void update_mask(FloatArray3D mask, uint64_t seed, float update_rate)
 {
     const uint64_t total = mask.shape(0) * mask.shape(1) * mask.shape(2);
-    nca_step::mask_kernel<<<(unsigned)std::min<uint64_t>((total + 255) / 256, 65535), 256>>>(mask.data(), total, seed, update_rate);
+    nca_step::mask_kernel<<<(unsigned)std::min<uint64_t>((total + 255) / 256, 65535), 256>>>(
+        mask.data(), mask.shape(0), mask.shape(1), mask.shape(2), seed, update_rate);
     cuda_check(cudaGetLastError());
 }
 
