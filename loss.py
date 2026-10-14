@@ -8,6 +8,28 @@ import torch
 import torchvision
 
 
+class _Pool2d(torch.autograd.Function):
+    """Non-overlapping 2x2 VGG pooling; save one byte per output for the backward."""
+
+    @staticmethod
+    def forward(ctx, x):
+        y, idx = x[:, :, ::2, ::2], torch.zeros_like(x[:, :, ::2, ::2], dtype=torch.uint8)
+        for i in range(1, 4):
+            v = x[:, :, i // 2::2, i % 2::2]
+            take = (v > y) | v.isnan()  # first maximum, last NaN, as in max_pool2d
+            y, idx = torch.where(take, v, y), torch.where(take, i, idx)
+        ctx.save_for_backward(idx)
+        return y.contiguous(memory_format=torch.channels_last)
+
+    @staticmethod
+    def backward(ctx, g):
+        idx, = ctx.saved_tensors
+        N, C, H, W = g.shape
+        v = torch.where(idx[..., None] == torch.arange(4, device=g.device), g[..., None], 0)
+        dx = v.reshape(N, C, H, W, 2, 2).permute(0, 1, 2, 4, 3, 5).reshape(N, C, 2 * H, 2 * W)
+        return dx.contiguous(memory_format=torch.channels_last)
+
+
 class _REMD(torch.autograd.Function):
     """Relaxed EMD per item: max(mean_j min_i cos_ij, mean_i min_j cos_ij), cos_ij = 1 - x_i y_j / (|x_i| |y_j| + 1e-10),
     for x (b, n, c) and y (b, m, c) (no gradient to y). Returns (b,)."""
@@ -58,7 +80,11 @@ class OTLoss(torch.nn.Module):
         x, feats = ((img - self.mean) / self.std).contiguous(memory_format=torch.channels_last), []
         with torch.autocast('cuda', torch.bfloat16, enabled=self.bf16):
             for i, layer in enumerate(self.vgg):
-                x = layer(x)
+                if (torch.compiler.is_compiling() and isinstance(layer, torch.nn.MaxPool2d)
+                        and x.shape[2] % 2 == 0 and x.shape[3] % 2 == 0):
+                    x = _Pool2d.apply(x)
+                else:
+                    x = layer(x)
                 if i in self.LAYERS:
                     feats.append(x.flatten(2).float())
         return feats
