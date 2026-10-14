@@ -294,7 +294,7 @@ void backward(FloatArray4D x, FloatArray4D gy, ByteArray3D alive, FloatArray3D w
                                                                        updating.data(), partial.data(), n0, batch_per_nca,
                                                                        H, W, seed, update_rate);
             cuda_check(cudaGetLastError());
-            nca_step::adjoint_kernel<D::C, D::ALIVE><<<dim3(ceil_div(H * W, nca_step::ADJ_PIX), n), nca_step::ADJ_PIX * D::C, 0, s>>>(
+            nca_step::adjoint_kernel<D::C, D::ALIVE><<<dim3(ceil_div(H * W, nca_step::ADJ_PIX), n), nca_step::ADJ_PIX * D::C / nca_step::ADJ_CPT, 0, s>>>(
                 dpc, updating.data() + n0 * plane, gy.data() + n0 * D::C * plane, alive.data() + (growing ? n0 * plane : 0),
                 gx.data() + n0 * D::C * plane, H, W);
             cuda_check(cudaGetLastError());
