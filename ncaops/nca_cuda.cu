@@ -101,11 +101,14 @@ static void launch_forward(const float *x, const float *w1, const float *b1, con
         constexpr int smem = sizeof(nca_step::ForwardSmem<D::C, D::HID, D::FP32>);
         static bool init = (set_smem(kernel, smem), true);
         (void)init;
-        const int tiles = ceil_div(W, nca_step::TILE_W) * ceil_div(H, nca_step::TILE_H);
-        // several tiles per block amortise the weight staging, unless that leaves SMs idle (small grids)
-        const int tpb = N * tiles >= 2 * nca_step::TILES_PER_BLOCK * sm_count() ? nca_step::TILES_PER_BLOCK : 1;
-        kernel<<<dim3(ceil_div(tiles, tpb), N), nca_step::FWD_THREADS, smem, stream>>>(
-            x, w1, b1, w2, y, alpha, B, H, W, seed, update_rate, tpb);
+        static const int blocks_per_sm = [&] { int b; cudaOccupancyMaxActiveBlocksPerMultiprocessor(&b, kernel, nca_step::FWD_THREADS, smem); return b; }();
+        // segments of whole columns, unless that gives less than two waves of blocks (shorter segments: more partial rounds)
+        const int strips = ceil_div(W, nca_step::TILE_W);
+        int seg = H;
+        while (seg > nca_step::FWD_PHASE && (size_t)N * strips * ceil_div(H, seg) < 2 * (size_t)blocks_per_sm * sm_count())
+            seg = ceil_div(seg, 2);
+        kernel<<<dim3(strips * ceil_div(H, seg), N), nca_step::FWD_THREADS, smem, stream>>>(
+            x, w1, b1, w2, y, alpha, B, H, W, seed, update_rate, seg);
         cuda_check(cudaGetLastError());
         if constexpr (D::ALIVE)
         {

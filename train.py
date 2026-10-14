@@ -49,7 +49,7 @@ class Texture:
     def __init__(self, cfg):
         from loss import OTLoss
         self.cfg, self.size = cfg, cfg['img_size']
-        self.ot = OTLoss(cfg['loss']['n_samples']).to(dev)
+        self.ot = OTLoss(cfg['loss']['n_samples'], cfg['loss']['vgg_bf16']).to(dev)
         if cfg['train']['compile_loss']:
             self.ot = torch.compile(self.ot)
 

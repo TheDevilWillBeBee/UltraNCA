@@ -11,23 +11,21 @@
 // It needs the neighbours' new alpha, so the forward kernel writes the unmasked y and its alpha plane, and
 // alive_kernel then applies a and stores it (uint8) for the backward.
 // Matmuls run on tensor cores (mma.sync m16n8k8 TF32, sm_80+). FP32 mode uses 3xTF32 (hi/lo operand split,
-// three MMAs per product), which matches fp32 to ~1e-6 relative. One warp computes 16 pixels of an image row
-// (the MMA M dimension); the four warps of a block cover a TILE_H x TILE_W tile, whose state (plus a 1-pixel
-// circular halo) is staged in shared memory. Weights are staged once per block in "fragment-major" order: each
+// three MMAs per product), which matches fp32 to ~1e-6 relative. One warp computes 16 pixels at a time (the MMA M
+// dimension), from the state (plus a 1-pixel circular halo) staged in shared memory: in the forward, 16 of the
+// updating pixels of a column strip (the others copy x); in the backward, 16 pixels of an image row of a block tile.
+// Weights are staged once per block in "fragment-major" order: each
 // lane reads its own pre-converted B-fragment registers, so the inner loops have no bank conflicts or conversions.
 // The hidden activations stay in registers between the two matmuls: the accumulator columns (2t, 2t+1) of an
 // n-tile are reused as the A-operand columns (t, t+4) of the next matmul by permuting W2's hidden index.
 namespace nca_step {
 
-// Tuning knobs (the NCA_* macros override them at build time for sweeps: build.sh "-DNCA_TILE_H=4 ...").
-#ifndef NCA_TILE_H
-#define NCA_TILE_H 16
-#endif
-#ifndef NCA_TILES_PER_BLOCK
-#define NCA_TILES_PER_BLOCK 2
-#endif
+// Tuning knobs (the NCA_* macros override them at build time for sweeps: build.sh "-DNCA_FWD_RING=20 ...").
 #ifndef NCA_FWD_WARPS
 #define NCA_FWD_WARPS 8
+#endif
+#ifndef NCA_FWD_RING
+#define NCA_FWD_RING 26
 #endif
 #ifndef NCA_BWD_TILES_PER_BLOCK
 #define NCA_BWD_TILES_PER_BLOCK 8
@@ -36,15 +34,11 @@ namespace nca_step {
 #define NCA_BWD_MIN_BLOCKS 2
 #endif
 constexpr int TILE_W = 16;                            // pixels per warp row = MMA M; must stay 16
-constexpr int TILE_H = NCA_TILE_H;                    // rows per forward block tile
-constexpr int FWD_WARPS = NCA_FWD_WARPS;              // forward: each warp takes TILE_H / FWD_WARPS rows of a tile
-constexpr int TILES_PER_BLOCK = NCA_TILES_PER_BLOCK;  // tiles of one image per block (amortises the weight staging);
-                                                      // fewer when there are too few blocks (forward_kernel argument)
+constexpr int FWD_WARPS = NCA_FWD_WARPS;              // forward: warps per block
 constexpr int FWD_THREADS = 32 * FWD_WARPS;
 static_assert(TILE_W == 16, "A warp's 16 pixels are the MMA M dimension");
-static_assert(TILE_H % FWD_WARPS == 0, "Rows of a tile are split evenly over the warps");
 
-constexpr int HALO_W = TILE_W + 2, HALO_H = TILE_H + 2;
+constexpr int HALO_W = TILE_W + 2;
 
 // identity, sobel_x, sobel_x^T, laplacian (cross-correlation taps, row-major dy, dx in -1..1); fully unrolled loops
 // drop the zero taps
@@ -266,14 +260,55 @@ struct Tile {
     }
 };
 
-// ---------------------------------------------------------------- shared-memory layout
+// ---------------------------------------------------------------- forward
+// Only the updating pixels (m = 1 and, for a growing NCA, a living cell within 2 pixels) go through the MLP. A block
+// sweeps a 16-pixel-wide column strip of an image (a segment of its rows) in phases of FWD_PHASE rows: it adds the
+// rows to a ring of state rows, writes y = x at the pixels that do not update, and appends the updating ones to a
+// queue. Every full round of FWD_WARPS * 16 queued pixels, each warp runs the MLP on 16 of them (the MMA rows),
+// perceived from the ring. Pixels stay queued across phases (the ring keeps the rows they need), so all warps of a
+// round are busy, and only the last round of a segment is partial.
+// Growing NCA: a pixel with no alpha > 0.1 within 2 pixels (rows of 16 pixels, at the row level) is dead before the
+// step and no living cell's alive test reads its new alpha: it is neither computed nor written (alive_kernel writes 0).
+constexpr int FWD_PHASE = 8;                // rows appended to the queue per phase (one thread per pixel)
+constexpr int FWD_RING = NCA_FWD_RING;      // state rows kept: the rows of the queued pixels, a phase and the halo
+constexpr int FWD_ROUND = 16 * FWD_WARPS;   // pixels per round
+constexpr int FWD_QUEUE = 256;              // queue entries (circular): < one round pending + one phase
+static_assert(FWD_ROUND + 16 * FWD_PHASE <= FWD_QUEUE && (FWD_QUEUE & (FWD_QUEUE - 1)) == 0, "queue size");
+static_assert(FWD_PHASE == 8 && 16 * FWD_PHASE <= FWD_THREADS, "one thread per pixel, two rows per warp; one Philox block per lane of a warp");
+
+// CH x ROWS rows of a 16-pixel-wide strip with 1-pixel halo columns: image row Y of a segment starting at y0 is in
+// slot (Y - y0 + 1) % ROWS. The plane stride is 8 or 24 mod 32 (fewer bank conflicts between the lanes' channels).
+template <int CH, int ROWS>
+struct Ring {
+    static constexpr int PLANE = conflict_free_stride(ROWS * HALO_W);
+    float v[CH][PLANE];
+    __device__ __forceinline__ float &at(int c, int slot, int col) { return v[c][slot * HALO_W + col]; }
+    // the four filters of channel c at the pixel whose rows above / at / below start at o[0..2] (offsets incl. column)
+    __device__ __forceinline__ void perceive(int c, const int (&o)[3], float (&p)[4]) const
+    {
+        float w[3][3];
+#pragma unroll
+        for (int dy = 0; dy < 3; ++dy)
+#pragma unroll
+            for (int dx = 0; dx < 3; ++dx)
+                w[dy][dx] = v[c][o[dy] + dx];
+        p[0] = w[1][1];
+        p[1] = (w[0][2] - w[0][0]) + 2.f * (w[1][2] - w[1][0]) + (w[2][2] - w[2][0]);
+        p[2] = (w[2][0] - w[0][0]) + 2.f * (w[2][1] - w[0][1]) + (w[2][2] - w[0][2]);
+        p[3] = (w[0][0] + w[0][2] + w[2][0] + w[2][2]) + 2.f * (w[0][1] + w[1][0] + w[1][2] + w[2][1]) - 12.f * w[1][1];
+    }
+};
+
 template <int C, int HID, bool FP32>
 struct ForwardSmem {
     using S = Shape<C, HID>;
     FragB<FP32> w1[S::NT1][S::KS1][32];   // p -> h: b0 = W1[8j+g][feature(s, t)], b1 = W1[8j+g][feature(s, t+4)]
     FragB<FP32> w2[S::NT2][S::NT1][32];   // h -> u: b0 = W2[8n+g][8j+2t], b1 = W2[8n+g][8j+2t+1] (permuted hidden)
     float b1[HID];
-    Tile<C, TILE_H> x;                    // state tile with circular halo
+    Ring<C, FWD_RING> x;                  // state rows of the strip
+    int queue[FWD_QUEUE];                 // updating pixels: 16 Y + column in the strip
+    uint32_t masks[4];                    // a phase's update masks (draw_masks())
+    uint32_t updating[FWD_PHASE / 2];     // a phase's updating pixels, 32 per warp (bit = lane)
 };
 
 // Stage one NCA's weights in fragment-major order.
@@ -298,111 +333,235 @@ __device__ void stage_forward_weights(ForwardSmem<C, HID, FP32> &sm, const float
         sm.b1[i] = b1[i];
 }
 
-// ---------------------------------------------------------------- forward
-// Growing NCA: does any cell within 2 pixels of the tile [y0, y0 + TH) x [x0, x0 + TILE_W) have alpha > 0.1 (no wrap)?
-// If not, every pixel of the tile and of its 1-pixel ring is dead before the step (pre-alive mask 0), so the tile's
-// output is 0 and no living cell depends on it: the step can skip it (alive_kernel writes its zeros). Block-uniform.
-template <int TH>
-__device__ bool near_alive(const float *__restrict__ alpha, int H, int W, int y0, int x0)
-{
-    bool any = false;
-    for (int i = threadIdx.x; i < (TH + 4) * (TILE_W + 4); i += blockDim.x) {
-        const int yy = y0 - 2 + i / (TILE_W + 4), xx = x0 - 2 + i % (TILE_W + 4);
-        any |= yy >= 0 && yy < H && xx >= 0 && xx < W && alpha[yy * W + xx] > 0.1f;
-    }
-    return __syncthreads_or(any);
-}
+// two resident blocks per SM (at most 128 registers) when their shared memory fits (sm_89: 100 KB per SM)
+template <int C, int HID, bool FP32>
+constexpr int fwd_min_blocks() { return !FP32 && sizeof(ForwardSmem<C, HID, FP32>) <= 49 * 1024 ? 2 : 1; }
 
+// grid (column strips * segments, N); each block: one segment of `seg` rows of one 16-pixel column strip
 template <int C, int HID, bool FP32, bool STOCH, bool ALIVE>
-__global__ void __launch_bounds__(FWD_THREADS) forward_kernel(
+__global__ void __launch_bounds__(FWD_THREADS, fwd_min_blocks<C, HID, FP32>()) forward_kernel(
     const float *__restrict__ x, const float *__restrict__ w1, const float *__restrict__ b1, const float *__restrict__ w2,
-    float *__restrict__ y, float *__restrict__ alpha, int B, int H, int W, uint64_t seed, float update_rate,
-    int tiles_per_block)
+    float *__restrict__ y, float *__restrict__ alpha, int B, int H, int W, uint64_t seed, float update_rate, int seg)
 {
     using S = Shape<C, HID>;
     extern __shared__ __align__(16) unsigned char smem_raw[];
     auto &sm = *reinterpret_cast<ForwardSmem<C, HID, FP32> *>(smem_raw);
 
-    const int n = blockIdx.y, k = n / B;
+    const int n = blockIdx.y, k = n / B, strips = (W + TILE_W - 1) / TILE_W;
+    const int x0 = (blockIdx.x % strips) * TILE_W, y0 = (blockIdx.x / strips) * seg, y1 = min(H, y0 + seg);
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, g = lane / 4, t = lane % 4;
-    const int tiles_x = (W + TILE_W - 1) / TILE_W, tiles = tiles_x * ((H + TILE_H - 1) / TILE_H);
-    const float *xn = x + (size_t)n * C * H * W;
-    float *yn = y + (size_t)n * C * H * W;
+    const size_t plane = (size_t)H * W;
+    const float *xn = x + n * C * plane;
+    float *yn = y + n * C * plane, *an = ALIVE ? alpha + n * plane : nullptr;
+    auto slot = [&](int Y) { return (Y - y0 + 1) % FWD_RING; };
 
-    bool weights_staged = false;
-    for (int tile = blockIdx.x * tiles_per_block; tile < min(tiles, (blockIdx.x + 1) * tiles_per_block); ++tile) {
-        const int y0 = (tile / tiles_x) * TILE_H, x0 = (tile % tiles_x) * TILE_W;
-        if (ALIVE && !near_alive<TILE_H>(xn + 3 * (size_t)H * W, H, W, y0, x0))
-            continue;
-        if (!weights_staged) {  // once per block, unless all its tiles are dead
-            stage_forward_weights<C, HID, FP32>(sm, w1 + (size_t)k * HID * S::PIN, b1 + (size_t)k * HID, w2 + (size_t)k * C * HID);
-            weights_staged = true;
+    // rows Y0 .. Y0 + rows - 1 (circular) of the strip with its halo columns, through registers: the loads of the
+    // next phase are issued before the current phase's rounds. Thread i holds the (channel, halo column) pairs
+    // i, i + FWD_THREADS, ... of each row.
+    constexpr int PAIRS = C * HALO_W, PP = (PAIRS + FWD_THREADS - 1) / FWD_THREADS;
+    float pre[PP][FWD_PHASE];
+    int pair_x[PP], pair_s[PP];  // offsets of the pair in a row of xn / in a ring row
+#pragma unroll
+    for (int i = 0; i < PP; ++i) {
+        const int pr = min((int)threadIdx.x + i * FWD_THREADS, PAIRS - 1), c = pr / HALO_W, col = pr % HALO_W;
+        const int gx = x0 - 1 + col;
+        pair_x[i] = c * (int)plane + (gx < 0 ? gx + W : gx >= W ? gx - W : gx);
+        pair_s[i] = c * Ring<C, FWD_RING>::PLANE + col;
+    }
+    auto fetch = [&](int Y0, int rows) {
+#pragma unroll
+        for (int r = 0; r < FWD_PHASE; ++r) {
+            const int gy = Y0 + r < 0 ? Y0 + r + H : Y0 + r >= H ? Y0 + r - H : Y0 + r;
+#pragma unroll
+            for (int i = 0; i < PP; ++i)
+                if (r < rows && threadIdx.x + i * FWD_THREADS < PAIRS)
+                    pre[i][r] = __ldcg(xn + pair_x[i] + gy * W);
         }
-        __syncthreads();  // previous tile's reads (and the weight staging) are complete
-        sm.x.load(xn, H, W, y0, x0);
-        __syncthreads();
+    };
+    auto store = [&](int Y0, int rows) {
+        int sl = slot(Y0);
+#pragma unroll
+        for (int r = 0; r < FWD_PHASE; ++r) {
+#pragma unroll
+            for (int i = 0; i < PP; ++i)
+                if (r < rows && threadIdx.x + i * FWD_THREADS < PAIRS)
+                    sm.x.v[0][pair_s[i] + sl * HALO_W] = pre[i][r];
+            sl = sl + 1 == FWD_RING ? 0 : sl + 1;
+        }
+    };
+    // update masks of the phase starting at row R0, by the last warp (one Philox block of 4 pixels per lane): bit
+    // 4 r + q of sm.masks[w] is the mask of row R0 + r, column x0 + 4 q + w
+    auto draw_masks = [&](int R0) {
+        if (STOCH && warp == FWD_WARPS - 1) {
+            const uint4 c = philox(seed, mask_counter(n, H, W, min(R0 + lane / 4, H - 1), x0 + 4 * (lane % 4)));
+            const uint32_t m[4] = {__ballot_sync(~0u, mask_bit(c.x, update_rate)), __ballot_sync(~0u, mask_bit(c.y, update_rate)),
+                                   __ballot_sync(~0u, mask_bit(c.z, update_rate)), __ballot_sync(~0u, mask_bit(c.w, update_rate))};
+            if (lane < 4)
+                sm.masks[lane] = m[lane];
+        }
+    };
+    // growing: alpha of rows Y0 - 2 .. Y0 + 3, columns x0 - 2 .. x0 + 17 (no wrap, 0 outside), for the near test of
+    // this warp's rows Y0, Y0 + 1
+    float pa[4];
+    auto fetch_alpha = [&](int Y0) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int idx = lane + 32 * i, yy = Y0 - 2 + idx / 20, xx = x0 - 2 + idx % 20;
+            pa[i] = idx < 120 && yy >= 0 && yy < H && xx >= 0 && xx < W ? xn[3 * plane + (size_t)yy * W + xx] : 0.f;
+        }
+    };
 
-        constexpr int RW = TILE_H / FWD_WARPS;  // rows of this warp
-        const uint4 masks = warp_masks<STOCH, RW>(seed, update_rate, n, H, W, y0 + warp * RW, x0);
-        for (int row = warp * RW; row < (warp + 1) * RW; ++row) {
-            Op4<FP32> a[S::KS1];  // A operand of p -> h
-            sm.x.template perceive_all<S::KS1>(row, g, t, [&](int s, int e, float v) { a[s].set(e, v); });
-            // h = relu(W1 p + b1): accumulator (pixel g / g + 8, hidden 8j + 2t / 2t + 1)
-            float h[S::NT1][4];
+    // MLP of the queued pixels first .. first + count - 1 (count <= 16) by this warp: y = x + u
+    auto run_group = [&](int first, int count) {
+        int Yp[2], cp[2], o[2][3];
 #pragma unroll
-            for (int j = 0; j < S::NT1; ++j) {
-                h[j][0] = h[j][2] = sm.b1[8 * j + 2 * t];
-                h[j][1] = h[j][3] = sm.b1[8 * j + 2 * t + 1];
+        for (int h = 0; h < 2; ++h) {  // fragment rows g, g + 8 (repeats of the last pixel past count)
+            const int e = sm.queue[(first + min(g + 8 * h, count - 1)) % FWD_QUEUE];
+            Yp[h] = e >> 4; cp[h] = e % 16;
+#pragma unroll
+            for (int dy = 0; dy < 3; ++dy)
+                o[h][dy] = slot(Yp[h] - 1 + dy) * HALO_W + cp[h];
+        }
+        Op4<FP32> a[S::KS1];  // A operand of p -> h (K order of feature())
+#pragma unroll
+        for (int q = 0; q < S::KS1 / 2; ++q) {
+            float p0[4], p1[4];
+            sm.x.perceive(4 * q + t, o[0], p0);
+            sm.x.perceive(4 * q + t, o[1], p1);
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                a[2 * q + h].set(0, p0[2 * h]); a[2 * q + h].set(1, p1[2 * h]);
+                a[2 * q + h].set(2, p0[2 * h + 1]); a[2 * q + h].set(3, p1[2 * h + 1]);
             }
+        }
+        // h = relu(W1 p + b1): accumulator (pixel g / g + 8, hidden 8j + 2t / 2t + 1)
+        float h[S::NT1][4];
 #pragma unroll
-            for (int s = 0; s < S::KS1; ++s)  // k outer: consecutive MMAs are independent
+        for (int j = 0; j < S::NT1; ++j) {
+            h[j][0] = h[j][2] = sm.b1[8 * j + 2 * t];
+            h[j][1] = h[j][3] = sm.b1[8 * j + 2 * t + 1];
+        }
 #pragma unroll
-                for (int j = 0; j < S::NT1; ++j)
-                    mma<FP32>(h[j], a[s], sm.w1[j][s][lane]);
+        for (int s = 0; s < S::KS1; ++s)  // k outer: consecutive MMAs are independent
 #pragma unroll
             for (int j = 0; j < S::NT1; ++j)
+                mma<FP32>(h[j], a[s], sm.w1[j][s][lane]);
 #pragma unroll
-                for (int e = 0; e < 4; ++e)
-                    h[j][e] = fmaxf(h[j][e], 0.f);
-            // u = W2 h: accumulator columns (2t, 2t + 1) of n-tile j are the A columns (t, t + 4) of k-step j.
-            float u2[2][S::NT2][4] = {};  // even / odd k-steps: twice the independent MMA chains
+        for (int j = 0; j < S::NT1; ++j)
 #pragma unroll
-            for (int j = 0; j < S::NT1; ++j) {
-                Op4<FP32> ah;
-                ah.set(0, h[j][0]); ah.set(1, h[j][2]); ah.set(2, h[j][1]); ah.set(3, h[j][3]);
+            for (int e = 0; e < 4; ++e)
+                h[j][e] = fmaxf(h[j][e], 0.f);
+        // u = W2 h: accumulator columns (2t, 2t + 1) of n-tile j are the A columns (t, t + 4) of k-step j.
+        float u2[2][S::NT2][4] = {};  // even / odd k-steps: twice the independent MMA chains
 #pragma unroll
-                for (int nt = 0; nt < S::NT2; ++nt)
-                    mma<FP32>(u2[j % 2][nt], ah, sm.w2[nt][j][lane]);
-            }
-            float u[S::NT2][4];
+        for (int j = 0; j < S::NT1; ++j) {
+            Op4<FP32> ah;
+            ah.set(0, h[j][0]); ah.set(1, h[j][2]); ah.set(2, h[j][1]); ah.set(3, h[j][3]);
+#pragma unroll
+            for (int nt = 0; nt < S::NT2; ++nt)
+                mma<FP32>(u2[j % 2][nt], ah, sm.w2[nt][j][lane]);
+        }
+        // y = x + u for pixels g, g + 8 and channels 8nt + 2t, 8nt + 2t + 1
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            if (g + 8 * h >= count)
+                continue;
+            const size_t pix = (size_t)Yp[h] * W + x0 + cp[h];
 #pragma unroll
             for (int nt = 0; nt < S::NT2; ++nt)
 #pragma unroll
-                for (int e = 0; e < 4; ++e)
-                    u[nt][e] = u2[0][nt][e] + u2[1][nt][e];
-            // y = x + u * m for pixels g, g + 8 and channels 8nt + 2t, 8nt + 2t + 1
-            const int gy = y0 + row;
-#pragma unroll
-            for (int half = 0; half < 2; ++half) {
-                const int px = g + 8 * half, gx = x0 + px;
-                if (gy >= H || gx >= W)
-                    continue;
-                const float m = mask_at(masks, row - warp * RW, px);
-#pragma unroll
-                for (int nt = 0; nt < S::NT2; ++nt)
-#pragma unroll
-                    for (int e = 0; e < 2; ++e) {
-                        const int ch = 8 * nt + 2 * t + e;
-                        if (ch >= C)
-                            continue;
-                        const float v = sm.x.at(ch, row + 1, px + 1) + u[nt][2 * half + e] * m;
-                        yn[((size_t)ch * H + gy) * W + gx] = v;
-                        if (ALIVE && ch == 3)
-                            alpha[((size_t)n * H + gy) * W + gx] = v;
-                    }
-            }
+                for (int e = 0; e < 2; ++e) {
+                    const int ch = 8 * nt + 2 * t + e;
+                    if (ch >= C)
+                        continue;
+                    const float v = sm.x.v[ch][o[h][1] + 1] + (u2[0][nt][2 * h + e] + u2[1][nt][2 * h + e]);
+                    yn[ch * plane + pix] = v;
+                    if (ALIVE && ch == 3)
+                        an[pix] = v;
+                }
         }
+    };
+
+    bool staged = false;  // the weights are staged before the first group (none in a dead segment)
+    int head = 0, count = 0;  // queue (block-uniform)
+    auto run = [&](int pixels) {  // the first `pixels` queued pixels, in groups of 16 over the warps
+        if (!staged) {
+            stage_forward_weights<C, HID, FP32>(sm, w1 + (size_t)k * HID * S::PIN, b1 + (size_t)k * HID, w2 + (size_t)k * C * HID);
+            __syncthreads();
+            staged = true;
+        }
+        for (int i = 16 * warp; i < pixels; i += FWD_ROUND)
+            run_group(head + i, min(16, pixels - i));
+        head += pixels; count -= pixels;
+    };
+
+    fetch(y0 - 1, 2);
+    store(y0 - 1, 2);
+    fetch(y0 + 1, min(FWD_PHASE, y1 - y0));
+    draw_masks(y0);
+    if (ALIVE && warp < FWD_PHASE / 2)
+        fetch_alpha(y0 + 2 * warp);
+    for (int r0 = y0; r0 < y1; r0 += FWD_PHASE) {
+        const int rows = min(FWD_PHASE, y1 - r0);
+        // the rows stored next replace those above r0 + rows + 1 - FWD_RING: first run the queued pixels that need them
+        if (count && (sm.queue[head % FWD_QUEUE] >> 4) - 1 < r0 + rows + 1 - FWD_RING)
+            run(count);
+        __syncthreads();  // the ring and queue reads of earlier groups are complete
+        store(r0 + 1, rows);  // rows r0 + 1 .. r0 + rows: rows r0 .. r0 + rows - 1 now have both neighbours
+
+        // pixel (r0 + 2 warp + lane / 16, x0 + lane % 16) of the phase: does it update?
+        const int Y = r0 + 2 * warp + lane / 16, X = x0 + lane % 16;
+        bool up = warp < FWD_PHASE / 2 && Y < r0 + rows && X < W;
+        if (STOCH)
+            up &= (sm.masks[lane % 4] >> (4 * (2 * warp + lane / 16) + lane % 16 / 4)) & 1u;
+        bool near = true;
+        if (ALIVE && warp < FWD_PHASE / 2) {
+            uint32_t rowbits = 0;  // bit r: alpha > 0.1 in row Y0 - 2 + r
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+                rowbits |= (pa[i] > 0.1f ? 1u : 0u) << ((lane + 32 * i) / 20);
+            rowbits = __reduce_or_sync(~0u, rowbits);
+            near = rowbits & (0x1Fu << (lane / 16));  // rows Y - 2 .. Y + 2
+            up &= near;
+        }
+        if (warp < FWD_PHASE / 2) {
+            const uint32_t bits = __ballot_sync(~0u, up);
+            if (lane == 0)
+                sm.updating[warp] = bits;
+        }
+        __syncthreads();  // ring rows stored, updating pixels counted
+        int added = 0, before = 0;  // queue positions of this phase's updating pixels
+#pragma unroll
+        for (int w = 0; w < FWD_PHASE / 2; ++w) {
+            const int c = __popc(sm.updating[w]);
+            before += w < warp ? c : 0;
+            added += c;
+        }
+        if (up)
+            sm.queue[(head + count + before + __popc(sm.updating[warp] & ((1u << lane) - 1))) % FWD_QUEUE] = 16 * Y + lane % 16;
+        else if (warp < FWD_PHASE / 2 && near && Y < r0 + rows && X < W) {  // y = x
+            const size_t pix = (size_t)Y * W + X;
+            const int s = slot(Y);
+#pragma unroll
+            for (int c = 0; c < C; ++c)
+                yn[c * plane + pix] = sm.x.at(c, s, lane % 16 + 1);
+            if (ALIVE)
+                an[pix] = sm.x.at(3, s, lane % 16 + 1);
+        }
+        count += added;
+        if (r0 + FWD_PHASE < y1)
+            draw_masks(r0 + FWD_PHASE);
+        __syncthreads();
+        if (r0 + FWD_PHASE < y1) {  // the next phase's loads overlap this phase's rounds
+            fetch(r0 + FWD_PHASE + 1, min(FWD_PHASE, y1 - r0 - FWD_PHASE));
+            if (ALIVE && warp < FWD_PHASE / 2)
+                fetch_alpha(r0 + FWD_PHASE + 2 * warp);
+        }
+        if (count >= FWD_ROUND)
+            run(count / FWD_ROUND * FWD_ROUND);
     }
+    if (count)
+        run(count);
 }
 
 // Alive mask of a growing-NCA step: a = (maxpool3(x_alpha) > 0.1) & (maxpool3(alpha) > 0.1) without wrap-around,
