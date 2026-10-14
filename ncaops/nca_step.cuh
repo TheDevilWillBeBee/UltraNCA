@@ -28,6 +28,10 @@ namespace nca_step {
 #ifndef NCA_SMEM_PER_SM_KB
 #define NCA_SMEM_PER_SM_KB 100
 #endif
+// A100-class GPUs (164 KB or more per SM: sm_80, sm_90): the choices below that were measured on an A100 and differ
+// from the sm_89 ones apply (README "A100"); everything else keeps the sm_89 defaults.
+#define NCA_A100_CLASS (NCA_SMEM_PER_SM_KB >= 164)
+constexpr bool A100_CLASS = NCA_A100_CLASS;
 #ifndef NCA_FWD_WARPS
 #define NCA_FWD_WARPS 8
 #endif
@@ -38,13 +42,16 @@ namespace nca_step {
 #define NCA_BWD_TILES_PER_BLOCK 8
 #endif
 #ifndef NCA_BWD_UNROLL
-#define NCA_BWD_UNROLL 2
+#define NCA_BWD_UNROLL (NCA_A100_CLASS ? 6 : 2)   // A100: 6 (4 % faster texture backward; 3, 4, 12 are not)
 #endif
 #ifndef NCA_BWD_MIN_BLOCKS
 #define NCA_BWD_MIN_BLOCKS 2
 #endif
 #ifndef NCA_ADJ_CPT
 #define NCA_ADJ_CPT 2
+#endif
+#ifndef NCA_ADJ_ROWS
+#define NCA_ADJ_ROWS 1
 #endif
 constexpr int TILE_W = 16;                            // pixels per warp row = MMA M; must stay 16
 constexpr int FWD_WARPS = NCA_FWD_WARPS;              // forward: warps per block
@@ -238,40 +245,51 @@ struct Tile {
 
     // The tile at (y0, x0) of an image (CH channel planes of H x W) with circular wrap, loaded by THREADS threads in
     // two steps (other work overlaps the loads): fetch() into registers, store() into the tile. Thread i holds halo
-    // pixel (i / 16, i % 16) in every channel, and elements i, i + THREADS, ... of the last two halo columns.
+    // pixels i, i + THREADS, ... (as (p / 16, p % 16)) in every channel, and elements i, i + THREADS, ... of the last
+    // two halo columns.
     static constexpr int ROWS = TH + 2, EXTRA = CH * ROWS * 2;
     template <int THREADS>
-    using Regs = float[CH + (EXTRA + THREADS - 1) / THREADS];
+    static constexpr int PPT = (ROWS * TILE_W + THREADS - 1) / THREADS;  // halo pixels per thread
+    template <int THREADS>
+    using Regs = float[CH * PPT<THREADS> + (EXTRA + THREADS - 1) / THREADS];
     template <int THREADS>
     __device__ __forceinline__ void fetch(Regs<THREADS> &r, const float *__restrict__ x, int H, int W, int y0, int x0) const
     {
         const int i = threadIdx.x;
-        if (i < ROWS * TILE_W) {
-            const float *p = x + (size_t)wrap(y0 - 1 + i / TILE_W, H) * W + wrap(x0 - 1 + i % TILE_W, W);
 #pragma unroll
-            for (int c = 0; c < CH; ++c)
-                r[c] = __ldcg(p + (size_t)c * H * W);
+        for (int k = 0; k < PPT<THREADS>; ++k) {
+            const int p = i + k * THREADS;
+            if (p < ROWS * TILE_W) {
+                const float *src = x + (size_t)wrap(y0 - 1 + p / TILE_W, H) * W + wrap(x0 - 1 + p % TILE_W, W);
+#pragma unroll
+                for (int c = 0; c < CH; ++c)
+                    r[k * CH + c] = __ldcg(src + (size_t)c * H * W);
+            }
         }
 #pragma unroll
         for (int k = 0; k < (EXTRA + THREADS - 1) / THREADS; ++k) {
             const int e = i + k * THREADS, c = e / (2 * ROWS), row = e / 2 % ROWS, col = TILE_W + e % 2;
             if (e < EXTRA)
-                r[CH + k] = __ldcg(x + ((size_t)c * H + wrap(y0 - 1 + row, H)) * W + wrap(x0 - 1 + col, W));
+                r[CH * PPT<THREADS> + k] = __ldcg(x + ((size_t)c * H + wrap(y0 - 1 + row, H)) * W + wrap(x0 - 1 + col, W));
         }
     }
     template <int THREADS>
     __device__ __forceinline__ void store(const Regs<THREADS> &r)
     {
         const int i = threadIdx.x;
-        if (i < ROWS * TILE_W)
 #pragma unroll
-            for (int c = 0; c < CH; ++c)
-                at(c, i / TILE_W, i % TILE_W) = r[c];
+        for (int k = 0; k < PPT<THREADS>; ++k) {
+            const int p = i + k * THREADS;
+            if (p < ROWS * TILE_W)
+#pragma unroll
+                for (int c = 0; c < CH; ++c)
+                    at(c, p / TILE_W, p % TILE_W) = r[k * CH + c];
+        }
 #pragma unroll
         for (int k = 0; k < (EXTRA + THREADS - 1) / THREADS; ++k) {
             const int e = i + k * THREADS;
             if (e < EXTRA)
-                at(e / (2 * ROWS), e / 2 % ROWS, TILE_W + e % 2) = r[CH + k];
+                at(e / (2 * ROWS), e / 2 % ROWS, TILE_W + e % 2) = r[CH * PPT<THREADS> + k];
         }
     }
 
@@ -383,9 +401,19 @@ __device__ void stage_forward_weights(ForwardSmem<C, HID, FP32> &sm, const float
         sm.b1[i] = b1[i];
 }
 
-// two resident blocks per SM (at most 128 registers per thread) when their shared memory fits
+// Two resident blocks per SM (at most 128 registers per thread) when their shared memory fits and a group's
+// accumulators (HID / 2 hidden units and 2 C perception features per thread) leave room under that cap: 16 / 128
+// spills heavily at 128 registers and runs twice as slow as one block at 188 (A100, where two of its blocks fit).
+// NCA_FWD_MIN_BLOCKS overrides the rule.
 template <int C, int HID, bool FP32>
-constexpr int fwd_min_blocks() { return !FP32 && smem_fits(sizeof(ForwardSmem<C, HID, FP32>), 2) ? 2 : 1; }
+constexpr int fwd_min_blocks()
+{
+#ifdef NCA_FWD_MIN_BLOCKS
+    return NCA_FWD_MIN_BLOCKS;
+#else
+    return !FP32 && HID / 2 + 2 * C <= 72 && smem_fits(sizeof(ForwardSmem<C, HID, FP32>), 2) ? 2 : 1;
+#endif
+}
 
 // grid (column strips * segments, N); each block: one segment of `seg` rows of one 16-pixel column strip
 template <int C, int HID, bool FP32, bool STOCH, bool ALIVE>
@@ -667,15 +695,18 @@ __global__ void alive_kernel(const float *__restrict__ x, const float *__restric
 // adjoint_kernel then forms dx = g + sum_f K_f^T * dp_f (transpose of the circular 3x3 filters).
 constexpr int BWD_WARPS = 4, BWD_THREADS = 32 * BWD_WARPS;
 constexpr int BWD_PIX = BWD_WARPS * TILE_W;  // pixels of a round
-// rows of a block tile: 4 (one round) when every pixel updates, else 6 (update rate 0.5: ~48 updating pixels,
-// almost always one round; the weight-gradient MMAs skip the empty pixel slots of a round)
-__host__ __device__ constexpr int bwd_tile_h(bool stoch) { return stoch ? 6 : 4; }
+// rows of a block tile: 4 (one round) when every pixel updates, else NCA_BWD_TILE_ROWS (default 6: update rate 0.5,
+// ~48 updating pixels, almost always one round; the weight-gradient MMAs skip the empty pixel slots of a round)
+#ifndef NCA_BWD_TILE_ROWS
+#define NCA_BWD_TILE_ROWS 6
+#endif
+__host__ __device__ constexpr int bwd_tile_h(bool stoch) { return stoch ? NCA_BWD_TILE_ROWS : 4; }
 static_assert(bwd_tile_h(true) * TILE_W <= BWD_THREADS && bwd_tile_h(true) <= 8, "one thread per pixel, one Philox block per lane");
 constexpr int BWD_TILES_PER_BLOCK = NCA_BWD_TILES_PER_BLOCK;  // tiles of one image per block (amortises accumulator write-out)
 constexpr int BWD_MIN_BLOCKS = NCA_BWD_MIN_BLOCKS;            // resident blocks per SM (register bound via __launch_bounds__)
 constexpr int BWD_UNROLL = NCA_BWD_UNROLL;                    // unrolling of the per-hidden-tile dh / dp loop (registers)
 #ifndef NCA_ABLATE
-#define NCA_ABLATE 0   // profiling only: 1 = skip weight gradients, 2 = skip dp stores, 3 = both
+#define NCA_ABLATE 0   // profiling only: 1 = skip weight gradients, 2 = skip dp stores, 4 = weight fragments made up in registers (no loads), 8 = dp stores all to one record
 #endif
 
 template <int C, int HID>
@@ -696,7 +727,11 @@ struct BwdShape {
     // relu(h) and dh are staged for the weight gradients in HPARTS parts of the hidden units when all of them do not
     // fit BWD_MIN_BLOCKS blocks per SM (16 / 128 on sm_89). With two parts, relu(h)'s second part goes to the p buffer
     // (p is staged again later, for dW1), and each warp owns NIWP n-tiles of each part.
+#ifdef NCA_BWD_HPARTS  // experiments
+    static constexpr int HPARTS = NCA_BWD_HPARTS;
+#else
     static constexpr int HPARTS = (NIW % 2 == 0 && HID / 2 <= PIN && !smem_fits(smem(1), BWD_MIN_BLOCKS)) ? 2 : 1;
+#endif
     static constexpr int HP = HID / HPARTS, NTH = NT1 / HPARTS, NIWP = NIW / HPARTS;
     // hidden n-tile of the warp's accumulator q
     __device__ static constexpr int owned(int warp, int q) { return (q / NIWP) * NTH + warp * NIWP + q % NIWP; }
@@ -800,6 +835,14 @@ __global__ void __launch_bounds__(BWD_THREADS, BWD_MIN_BLOCKS) backward_kernel(
     const float *xn = x + n * C * plane, *gyn = gy + n * C * plane;
     float *dpn = dp + blockIdx.y * BS::PIN * plane;
     const auto &wk = packed[k];
+    auto frag2 = [&](const FragB2<FP32> &f, int salt) -> FragB2<FP32> {  // a weight-fragment pair (NCA_ABLATE & 4: made up)
+        if constexpr (NCA_ABLATE & 4) {
+            FragB2<FP32> r;
+            r.v = make_uint4(0x3d000000u + salt, 0x3d000000u + lane, 0x3d000000u + 2 * salt, 0x3d000000u + 3 * lane);
+            return r;
+        } else
+            return f;
+    };
 
     float accp[BS::MTA][BS::NIW][4] = {};   // p^T dh        -> dW1^T, hidden n-tiles of this warp
     float accg[BS::MT2][BS::NIW][4] = {};   // gm^T relu(h)  -> dW2
@@ -808,7 +851,9 @@ __global__ void __launch_bounds__(BWD_THREADS, BWD_MIN_BLOCKS) backward_kernel(
     for (int tile = blockIdx.x * BWD_TILES_PER_BLOCK; tile < min(tiles, (blockIdx.x + 1) * BWD_TILES_PER_BLOCK); ++tile) {
         const int y0 = (tile / tiles_x) * TH, x0 = (tile % tiles_x) * TILE_W;
         typename Tile<C, TH>::template Regs<BWD_THREADS> xr;
-        sm.x.template fetch<BWD_THREADS>(xr, xn, H, W, y0, x0);
+        constexpr bool skip_dead = ALIVE && A100_CLASS;  // growing NCAs: most tiles are dead and need no state
+        if constexpr (!skip_dead)  // the tile loads overlap the mask computation
+            sm.x.template fetch<BWD_THREADS>(xr, xn, H, W, y0, x0);
         // the updating pixels of the tile, as bit words (every warp computes them all: block-uniform count)
         const uint4 masks = warp_masks<STOCH, TH>(seed, update_rate, n, H, W, y0, x0);
         uint32_t words[WORDS];
@@ -821,6 +866,9 @@ __global__ void __launch_bounds__(BWD_THREADS, BWD_MIN_BLOCKS) backward_kernel(
             words[w] = __ballot_sync(~0u, up);
             count += __popc(words[w]);
         }
+        if constexpr (skip_dead)  // (A100: growing backward 306 -> 240 us at 5 % alive, 555 -> 523 at 30 %)
+            if (count)
+                sm.x.template fetch<BWD_THREADS>(xr, xn, H, W, y0, x0);
         __syncthreads();  // previous tile's shared reads are complete
         if (threadIdx.x < TPIX) {  // pixel list (in order); the updating map (dp is only written at updating pixels)
             const int px = threadIdx.x, w = px / 32, Y = y0 + px / TILE_W, X = x0 + px % TILE_W;
@@ -870,7 +918,7 @@ __global__ void __launch_bounds__(BWD_THREADS, BWD_MIN_BLOCKS) backward_kernel(
                     float h[4] = {wk.b1[8 * j + 2 * t], wk.b1[8 * j + 2 * t + 1], wk.b1[8 * j + 2 * t], wk.b1[8 * j + 2 * t + 1]};
 #pragma unroll
                     for (int s = 0; s < BS::KS1; s += 2) {
-                        const FragB2<FP32> b = wk.w1h[j][s / 2][lane];
+                        const FragB2<FP32> b = frag2(wk.w1h[j][s / 2][lane], j + s);
                         mma<FP32>(h, a[s], b[0]);
                         mma<FP32>(h, a[s + 1], b[1]);
                     }
@@ -896,7 +944,7 @@ __global__ void __launch_bounds__(BWD_THREADS, BWD_MIN_BLOCKS) backward_kernel(
                 dh[0] = dh[1] = dh[2] = dh[3] = 0.f;
 #pragma unroll
                 for (int q = 0; q < BS::NT2; ++q)
-                    mma<FP32>(dh, ag[q], wk.w2d[j][q / 2][lane][q % 2]);
+                    mma<FP32>(dh, ag[q], frag2(wk.w2d[j][q / 2][lane], j + q)[q % 2]);
             };
 
             // ---- dW2 += gm^T relu(h) over the round's pixels (occupied k-steps only). Each warp owns NIW
@@ -945,7 +993,7 @@ __global__ void __launch_bounds__(BWD_THREADS, BWD_MIN_BLOCKS) backward_kernel(
                     ad.set(0, dh[0]); ad.set(1, dh[2]); ad.set(2, dh[1]); ad.set(3, dh[3]);
 #pragma unroll
                     for (int nt = 0; nt < BS::NTP; nt += 2) {
-                        const FragB2<FP32> b = wk.w1p[j][nt / 2][lane];
+                        const FragB2<FP32> b = frag2(wk.w1p[j][nt / 2][lane], j + nt);
                         mma<FP32>(d[nt], ad, b[0]);
                         mma<FP32>(d[nt + 1], ad, b[1]);
                     }
@@ -960,7 +1008,7 @@ __global__ void __launch_bounds__(BWD_THREADS, BWD_MIN_BLOCKS) backward_kernel(
                         if (valid[h])
 #pragma unroll
                             for (int nt = 0; nt < BS::NTP; ++nt)
-                                *reinterpret_cast<float2 *>(dpn + ((size_t)(y0 + pr[h]) * W + x0 + pc[h]) * BS::PIN + 8 * nt + 2 * t) =
+                                *reinterpret_cast<float2 *>(dpn + ((NCA_ABLATE & 8 ? (size_t)y0 * W + x0 : (size_t)(y0 + pr[h]) * W + x0 + pc[h]) * BS::PIN) + 8 * nt + 2 * t) =
                                     make_float2(d[nt][2 * h], d[nt][2 * h + 1]);
                 if constexpr (BS::HPARTS == 2)  // p again (cheap), into the buffer that held relu(h)
                     sm.x.template perceive_all<BS::KS1>(pr[0], pc[0], pr[1], pc[1], t, stage_p);
@@ -1085,28 +1133,34 @@ __global__ void reduce_kernel(const float *__restrict__ partial, int blocks_per_
 }
 
 // dx = g (* a) + sum_o sum_f K_f(o) dp_{4c+f}(y - o), the transpose of the circular perception filters, over the
-// updating pixels' dp (pixel-major, (N, H, W, 4C); not written elsewhere). A block takes 32 consecutive pixels of an
-// image and all C channels, ADJ_CPT channels per thread (more loads in flight per thread; latency-bound): the 9
-// neighbours of each pixel (offset, or -1 if not updating) are found once, then a thread reads its channels' 4
-// features of each updating neighbour (16-byte loads; the threads of a pixel read its 4C features contiguously); the
-// sums go through shared memory so that dx is written by rows.
-constexpr int ADJ_PIX = 32, ADJ_CPT = NCA_ADJ_CPT;
+// updating pixels' dp (pixel-major, (N, H, W, 4C); not written elsewhere). A block takes ADJ_ROWS rows of 32 pixels
+// of an image (a 2-D patch: the neighbour records of adjacent pixels are reused through L1) and all C channels,
+// ADJ_CPT channels per thread (more loads in flight per thread; latency-bound): the 9 neighbours of each pixel
+// (offset, or -1 if not updating) are found once, then a thread reads its channels' 4 features of each updating
+// neighbour (16-byte loads; the threads of a pixel read its 4C features contiguously); the sums go through shared
+// memory so that dx is written by rows.
+constexpr int ADJ_PIX = 32, ADJ_ROWS = NCA_ADJ_ROWS;
+// channels per thread: NCA_ADJ_CPT, except growing NCAs on A100-class GPUs (4: mostly dead pixels, fewer threads per
+// pixel and more blocks in flight; 130 vs 192 us at 5 % alive, texture NCAs prefer 2)
+__host__ __device__ constexpr int adj_cpt(bool alive) { return alive && A100_CLASS ? 4 : NCA_ADJ_CPT; }
 template <int C, bool ALIVE>
-__global__ void __launch_bounds__(ADJ_PIX * C / ADJ_CPT) adjoint_kernel(const float *__restrict__ dp, const uint8_t *__restrict__ updating,
-                                                                      const float *__restrict__ gy, const uint8_t *__restrict__ alive,
-                                                                      float *__restrict__ gx, int H, int W)  // grid (pixels / 32, images)
+__global__ void __launch_bounds__(ADJ_PIX * ADJ_ROWS * C / adj_cpt(ALIVE)) adjoint_kernel(const float *__restrict__ dp, const uint8_t *__restrict__ updating,
+                                                                                        const float *__restrict__ gy, const uint8_t *__restrict__ alive,
+                                                                                        float *__restrict__ gx, int H, int W)  // grid (ceil(W / 32) ceil(H / ADJ_ROWS), images)
 {
+    constexpr int ADJ_CPT = adj_cpt(ALIVE);
     static_assert(C % ADJ_CPT == 0, "channels per thread");
-    constexpr int TPP = C / ADJ_CPT, THREADS = ADJ_PIX * TPP;  // threads per pixel
-    __shared__ int nb[9][ADJ_PIX];
-    __shared__ float sum[C][ADJ_PIX + 1];
-    const size_t n = blockIdx.y, plane = (size_t)H * W, P0 = blockIdx.x * (size_t)ADJ_PIX;
+    constexpr int TPP = C / ADJ_CPT, PIX = ADJ_PIX * ADJ_ROWS, THREADS = PIX * TPP;  // threads per pixel, pixels per block
+    __shared__ int nb[9][PIX];
+    __shared__ float sum[C][PIX + 1];
+    const size_t n = blockIdx.y, plane = (size_t)H * W;
+    const int cols = (W + ADJ_PIX - 1) / ADJ_PIX, Y0 = (blockIdx.x / cols) * ADJ_ROWS, X0 = (blockIdx.x % cols) * ADJ_PIX;
     const float *dpn = dp + n * plane * 4 * C;
-    for (int e = threadIdx.x; e < 9 * ADJ_PIX; e += THREADS) {  // neighbour j = (dy, dx) of pixel i: its offset in the image if it updates, else -1
-        const int j = e / ADJ_PIX, i = e % ADJ_PIX, P = P0 + i;
+    for (int e = threadIdx.x; e < 9 * PIX; e += THREADS) {  // neighbour j = (dy, dx) of pixel i: its offset in the image if it updates, else -1
+        const int j = e / PIX, i = e % PIX, Y = Y0 + i / ADJ_PIX, X = X0 + i % ADJ_PIX;
         int q = -1;
-        if (P < plane) {
-            q = wrap(P / W + 1 - j / 3, H) * W + wrap(P % W + 1 - j % 3, W);
+        if (Y < H && X < W) {
+            q = wrap(Y + 1 - j / 3, H) * W + wrap(X + 1 - j % 3, W);
             q = updating[n * plane + q] ? q : -1;
         }
         nb[j][i] = q;
@@ -1136,11 +1190,10 @@ __global__ void __launch_bounds__(ADJ_PIX * C / ADJ_CPT) adjoint_kernel(const fl
             sum[c0 + cc][i] = v[cc];
     }
     __syncthreads();
-    for (int e = threadIdx.x; e < C * ADJ_PIX; e += THREADS) {
-        const int i = e % ADJ_PIX, c = e / ADJ_PIX;
-        const size_t P = P0 + i;
-        if (P < plane) {
-            const size_t o = (n * C + c) * plane + P;
+    for (int e = threadIdx.x; e < C * PIX; e += THREADS) {
+        const int i = e % PIX, c = e / PIX, Y = Y0 + i / ADJ_PIX, X = X0 + i % ADJ_PIX;
+        if (Y < H && X < W) {
+            const size_t P = (size_t)Y * W + X, o = (n * C + c) * plane + P;
             gx[o] = (ALIVE && !alive[n * plane + P] ? 0.f : gy[o]) + sum[c][i];
         }
     }

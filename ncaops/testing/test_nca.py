@@ -11,8 +11,10 @@ import nca_ops
 FILTERS = torch.stack([torch.tensor([[0., 0, 0], [0, 1, 0], [0, 0, 0]]), torch.tensor([[-1., 0, 1], [-2, 0, 2], [-1, 0, 1]]),
                        torch.tensor([[-1., -2, -1], [0, 0, 0], [1, 2, 1]]), torch.tensor([[1., 2, 1], [2, -12, 2], [1, 2, 1]])])[:, None]
 # relative-error bounds: fp32 = 3xTF32; TF32 errors are those of TF32 itself (eager PyTorch TF32 vs FP32 is the same).
-# The TF32 forward bound allows the odd growing-NCA cell whose alive test (alpha > 0.1) flips under TF32 rounding.
+# A growing-NCA cell whose alive test (alpha > 0.1) flips under TF32 rounding differs by its whole state (and so do its
+# 8 neighbours): such cells are excluded from the forward error and counted instead (at most FLIPS per case).
 BOUNDS = {True: (1e-5, 1e-5), False: (1e-2, 3e-2)}  # fp32: (forward, gradients)
+FLIPS = {True: 0, False: 32}
 
 
 def alive(x):  # GrowingNCA.get_living_mask: x (K, B, C, H, W) -> (K, B, 1, H, W)
@@ -31,6 +33,15 @@ def reference_step(x, w1, b1, w2, mask, growing=False):
 
 def rel(a, b):
     return ((a - b).norm() / b.norm()).item()
+
+
+def forward_error(out, ref, growing):
+    """Relative error of a step; growing: without the cells that are dead (all channels 0) on one side only, whose
+    number is returned too."""
+    if not growing:
+        return rel(out, ref), 0
+    flip = (out == 0).all(2, keepdim=True) != (ref == 0).all(2, keepdim=True)
+    return rel(out.masked_fill(flip, 0), ref.masked_fill(flip, 0)), flip.sum().item()
 
 
 def make(K, B, C=12, HID=96, H=128, W=128, seed=0, growing=False):
@@ -60,11 +71,13 @@ def test():
         for rate in (0.5, 1.0):
             for growing in (False, True):
                 fwd, bwd, det = {True: 0., False: 0.}, {True: 0., False: 0.}, True
+                flips = {True: 0, False: 0}
                 for K, B, H, W in ((3, 2, 128, 128), (2, 3, 37, 50), (1, 1, 8, 16)):
                     x, w1, b1, w2 = make(K, B, C, HID, H, W, growing=growing)
                     ref = reference_step(x, w1, b1, w2, mask_for(K, B, H, W, 1234, rate), growing)
                     for fp32 in (True, False):
-                        fwd[fp32] = max(fwd[fp32], rel(nca_ops.step(x, w1, b1, w2, rate, growing, fp32=fp32, seed=1234), ref))
+                        err, n = forward_error(nca_ops.step(x, w1, b1, w2, rate, growing, fp32=fp32, seed=1234), ref, growing)
+                        fwd[fp32] = max(fwd[fp32], err); flips[fp32] += n
                 for K, B, H, W in ((3, 2, 64, 64), (2, 3, 37, 50)):
                     x, w1, b1, w2 = make(K, B, C, HID, H, W, growing=growing)
                     R, mask = torch.randn_like(x), mask_for(K, B, H, W, 99, rate)
@@ -78,11 +91,11 @@ def test():
                     det &= all(torch.equal(a, b) for a, b in zip(out, grads(lambda *p: nca_ops.step(*p, rate, growing, seed=99))))
                     nca_ops.CHUNK = None
                     det &= all(torch.equal(a, b) for a, b in zip(out, grads(lambda *p: nca_ops.step(*p, rate, growing, seed=99))))
-                passed = det and all(fwd[p] < BOUNDS[p][0] and bwd[p] < BOUNDS[p][1] for p in (True, False))
+                passed = det and all(fwd[p] < BOUNDS[p][0] and bwd[p] < BOUNDS[p][1] and flips[p] <= FLIPS[p] for p in (True, False))
                 ok &= passed
                 print(f'{C:2d}/{HID:3d} rate={rate} {"growing" if growing else "texture"}: fp32 fwd {fwd[True]:.1e} grad '
                       f'{bwd[True]:.1e} | tf32 fwd {fwd[False]:.1e} grad {bwd[False]:.1e} | deterministic {det} | '
-                      f'{"ok" if passed else "FAILED"}', flush=True)
+                      + (f'alive flips {flips[True]} / {flips[False]} | ' if growing else '') + f'{"ok" if passed else "FAILED"}', flush=True)
     for growing in (False, True):  # rollout = repeated steps (every cell updating: no dependence on the seeds)
         x, w1, b1, w2 = make(2, 2, 16, 128, 40, 48, growing=growing)
         for steps in (0, 1, 2, 5):

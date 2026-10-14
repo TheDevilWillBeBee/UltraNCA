@@ -6,6 +6,7 @@
 #include <vector>
 #include <tuple>
 #include <algorithm>
+#include <cstdlib>
 #include <type_traits>
 #include <nanobind/stl/tuple.h>
 #include "nca_step.cuh"
@@ -80,6 +81,8 @@ template <typename Kernel>
 void set_smem(Kernel kernel, int bytes)
 {
     cuda_check(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
+    if (const char *env = std::getenv("NCA_CARVEOUT"))  // experiments: preferred shared-memory carveout (percent)
+        cuda_check(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, std::atoi(env)));
 }
 
 static int ceil_div(int a, int b) { return (a + b - 1) / b; }
@@ -108,6 +111,8 @@ static void launch_forward(const float *x, const float *w1, const float *b1, con
         int seg = D::ALIVE ? std::min<int>(H, 128) : H;
         while (seg > nca_step::FWD_PHASE && (size_t)N * strips * ceil_div(H, seg) < 2 * (size_t)blocks_per_sm * sm_count())
             seg = ceil_div(seg, 2);
+        if (const char *env = std::getenv("NCA_FWD_SEG"))  // experiments
+            seg = std::max(1, std::min<int>(H, std::atoi(env)));
         kernel<<<dim3(strips * ceil_div(H, seg), N), nca_step::FWD_THREADS, smem, stream>>>(
             x, w1, b1, w2, y, alpha, B, H, W, seed, update_rate, seg);
         cuda_check(cudaGetLastError());
@@ -192,14 +197,22 @@ static int backward_blocks_per_image(int H, int W, bool stoch)
 // other stream's adjoint), and the dp (4C planes per image) of both chunks in flight fits in L2. Growing NCAs write
 // dp only at the alive updating pixels (assumed at most half the grid) and most of their blocks have nothing to do:
 // at least N / 4 images per chunk. Measured on sm_89: 15-20 % faster than one launch.
+// A100-class GPUs (164 KB or more of shared memory per SM; measured on an A100, see README "A100"): keeping dp in
+// L2 does not pay and launches below a wave leave SMs idle, so texture NCAs use about four chunks of at least a wave
+// each (the overlap of the two streams is worth 8 %), and growing NCAs one launch.
 static size_t chunk_images(size_t N, size_t C, size_t H, size_t W, int blocks_per_image, int blocks_per_sm, bool growing)
 {
-    int dev, sms, l2;
+    int dev, sms, l2, smem_per_sm;
     cudaGetDevice(&dev);
     cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
     cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, dev);
+    cudaDeviceGetAttribute(&smem_per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev);
     const size_t wave = sms * blocks_per_sm / blocks_per_image, fit = l2 / 2 / (4 * C * H * W * sizeof(float));
-    const size_t chunk = growing ? std::min<size_t>(2 * fit, (N + 3) / 4) : std::min<size_t>(2 * wave / 3, fit);
+    size_t chunk;
+    if (smem_per_sm >= 160 * 1024)
+        chunk = growing ? N : std::max<size_t>(ceil_div(sms * blocks_per_sm, blocks_per_image), (N + 3) / 4);
+    else
+        chunk = growing ? std::min<size_t>(2 * fit, (N + 3) / 4) : std::min<size_t>(2 * wave / 3, fit);
     return std::clamp<size_t>(chunk, 1, N);
 }
 
@@ -281,7 +294,8 @@ void backward(FloatArray4D x, FloatArray4D gy, ByteArray3D alive, FloatArray3D w
         set_smem(kernel, smem);
         const int blocks = backward_blocks_per_image(H, W, D::STOCH);
         const size_t plane = H * W;
-        const bool split = chunk < N;
+        static const bool serial = std::getenv("NCA_SERIAL_CHUNKS") != nullptr;  // experiments: chunks on one stream
+        const bool split = chunk < N && !serial;
         if (split)
             for (int i = 0; i < 2; ++i)
                 join(side_stream(i), stream);
@@ -294,7 +308,8 @@ void backward(FloatArray4D x, FloatArray4D gy, ByteArray3D alive, FloatArray3D w
                                                                        updating.data(), partial.data(), n0, batch_per_nca,
                                                                        H, W, seed, update_rate);
             cuda_check(cudaGetLastError());
-            nca_step::adjoint_kernel<D::C, D::ALIVE><<<dim3(ceil_div(H * W, nca_step::ADJ_PIX), n), nca_step::ADJ_PIX * D::C / nca_step::ADJ_CPT, 0, s>>>(
+            nca_step::adjoint_kernel<D::C, D::ALIVE><<<dim3(ceil_div(W, nca_step::ADJ_PIX) * ceil_div(H, nca_step::ADJ_ROWS), n),
+                                                       nca_step::ADJ_PIX * nca_step::ADJ_ROWS * D::C / nca_step::adj_cpt(D::ALIVE), 0, s>>>(
                 dpc, updating.data() + n0 * plane, gy.data() + n0 * D::C * plane, alive.data() + (growing ? n0 * plane : 0),
                 gx.data() + n0 * D::C * plane, H, W);
             cuda_check(cudaGetLastError());
