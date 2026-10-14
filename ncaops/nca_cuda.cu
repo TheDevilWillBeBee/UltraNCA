@@ -188,16 +188,19 @@ static int backward_blocks_per_image(int H, int W, bool stoch)
 
 // Images per backward chunk: the backward and adjoint kernels run on chunks of images, alternating between two
 // streams with a dp buffer each, so that the adjoint reads dp from L2 rather than DRAM and each chunk's backward
-// overlaps the other's tail. A chunk is about one wave of resident backward blocks, and the dp (4C planes per image)
-// of both chunks in flight fits in L2 (measured on sm_89: 13-23 % faster than one launch).
-static size_t chunk_images(size_t N, size_t C, size_t H, size_t W, int blocks_per_image, int blocks_per_sm)
+// overlaps the other's adjoint. A chunk's backward is about two thirds of a wave of resident blocks (room for the
+// other stream's adjoint), and the dp (4C planes per image) of both chunks in flight fits in L2. Growing NCAs write
+// dp only at the alive updating pixels (assumed at most half the grid) and most of their blocks have nothing to do:
+// at least N / 4 images per chunk. Measured on sm_89: 15-20 % faster than one launch.
+static size_t chunk_images(size_t N, size_t C, size_t H, size_t W, int blocks_per_image, int blocks_per_sm, bool growing)
 {
     int dev, sms, l2;
     cudaGetDevice(&dev);
     cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
     cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, dev);
     const size_t wave = sms * blocks_per_sm / blocks_per_image, fit = l2 / 2 / (4 * C * H * W * sizeof(float));
-    return std::clamp<size_t>(std::min(wave, fit), 1, N);
+    const size_t chunk = growing ? std::min<size_t>(2 * fit, (N + 3) / 4) : std::min<size_t>(2 * wave / 3, fit);
+    return std::clamp<size_t>(chunk, 1, N);
 }
 
 // The two streams of the chunked backward (created once, for the current device).
@@ -220,7 +223,7 @@ static void join(cudaStream_t waiter, cudaStream_t stream)
 
 // Workspace sizes for backward(): (packed weight bytes per NCA, partial floats per image, images per chunk).
 std::tuple<size_t, size_t, size_t> backward_workspace(size_t C, size_t HID, bool fp32, size_t N, size_t H, size_t W,
-                                                      float update_rate)
+                                                      float update_rate, bool growing)
 {
     return dispatch(C, HID, fp32, update_rate < 1.f, false, [&](auto I) {
         using D = decltype(I);
@@ -232,7 +235,7 @@ std::tuple<size_t, size_t, size_t> backward_workspace(size_t C, size_t HID, bool
         const int blocks = backward_blocks_per_image(H, W, D::STOCH);
         return std::make_tuple(sizeof(nca_step::BackwardWeights<D::C, D::HID, D::FP32>),
                                (size_t)blocks * nca_step::BwdShape<D::C, D::HID>::PARTIAL,
-                               chunk_images(N, C, H, W, blocks, blocks_per_sm));
+                               chunk_images(N, C, H, W, blocks, blocks_per_sm, growing));
     });
 }
 
@@ -253,7 +256,7 @@ void backward(FloatArray4D x, FloatArray4D gy, ByteArray3D alive, FloatArray3D w
     validate_array_shape(db1, {K, HID}, "db1");
     validate_array_shape(w2, {K, C, HID}, "w2");
     validate_array_shape(dw2, {K, C, HID}, "dw2");
-    const auto workspace = backward_workspace(C, HID, fp32, N, H, W, update_rate);
+    const auto workspace = backward_workspace(C, HID, fp32, N, H, W, update_rate, growing);
     const size_t packed_bytes = std::get<0>(workspace), partial_floats = std::get<1>(workspace);
     // dp: N images (one launch on `stream`), or two chunks of dp.shape[0] / 2 images (alternating side streams)
     const size_t chunk = dp.shape(0) >= N ? N : dp.shape(0) / 2;
@@ -291,7 +294,7 @@ void backward(FloatArray4D x, FloatArray4D gy, ByteArray3D alive, FloatArray3D w
                                                                        updating.data(), partial.data(), n0, batch_per_nca,
                                                                        H, W, seed, update_rate);
             cuda_check(cudaGetLastError());
-            nca_step::adjoint_kernel<D::C, D::ALIVE><<<dim3(ceil_div(H * W, 32), n), 32 * D::C, 0, s>>>(
+            nca_step::adjoint_kernel<D::C, D::ALIVE><<<dim3(ceil_div(H * W, nca_step::ADJ_PIX), n), nca_step::ADJ_PIX * D::C, 0, s>>>(
                 dpc, updating.data() + n0 * plane, gy.data() + n0 * D::C * plane, alive.data() + (growing ? n0 * plane : 0),
                 gx.data() + n0 * D::C * plane, H, W);
             cuda_check(cudaGetLastError());
@@ -326,7 +329,7 @@ NB_MODULE(nca_cuda, m)
           "`steps` forward steps from x into y (tmp: workspace like x if steps > 1), with the step seeds derived from "
           "`seed`; no gradients.");
     m.def("backward_workspace", &backward_workspace, "channels"_a, "hidden"_a, "fp32"_a, "N"_a, "H"_a, "W"_a, "update_rate"_a,
-          "(packed weight bytes per NCA, partial floats per image, images of dp) for backward().");
+          "growing"_a, "(packed weight bytes per NCA, partial floats per image, images per dp chunk) for backward().");
     m.def("backward", &backward, "x"_a, "gy"_a, "alive"_a, "w1"_a, "b1"_a, "w2"_a, "gx"_a, "dw1"_a, "db1"_a, "dw2"_a,
           "packed"_a, "dp"_a, "updating"_a, "partial"_a, "batch_per_nca"_a, "seed"_a, "update_rate"_a, "fp32"_a, "growing"_a, "stream"_a,
           "Gradients of one NCA step (same seed, update_rate and, if growing, alive mask as the forward). Writes gx, dw1, db1, dw2; packed, dp and partial "

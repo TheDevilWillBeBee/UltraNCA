@@ -659,7 +659,8 @@ __global__ void alive_kernel(const float *__restrict__ x, const float *__restric
 //   dp = dh W1                          (MMA, permuted hidden index as in the forward) -> global (N, H, W, 4C)
 //   dW2 += (g * m)^T relu(h),  dW1 += dh^T p   (MMA over the pixels of the tile, per-block accumulators)
 //   db1 += column sums of the staged dh
-// Each block writes its weight-gradient partials; reduce_kernel sums them per NCA in a fixed order (deterministic).
+// Each block that had an updating pixel writes its weight-gradient partials (flagged); reduce_kernel sums the flagged
+// partials of each NCA in block order (deterministic).
 // adjoint_kernel then forms dx = g + sum_f K_f^T * dp_f (transpose of the circular 3x3 filters).
 constexpr int BWD_WARPS = 4, BWD_THREADS = 32 * BWD_WARPS;
 constexpr int BWD_PIX = BWD_WARPS * TILE_W;  // pixels of a round
@@ -696,7 +697,7 @@ struct BwdShape {
     static constexpr int HP = HID / HPARTS, NTH = NT1 / HPARTS, NIWP = NIW / HPARTS;
     // hidden n-tile of the warp's accumulator q
     __device__ static constexpr int owned(int warp, int q) { return (q / NIWP) * NTH + warp * NIWP + q % NIWP; }
-    static constexpr int PARTIAL = HID * PIN + HID + C * HID;  // dW1, db1, dW2 per block
+    static constexpr int PARTIAL = HID * PIN + HID + C * HID + 1;  // dW1, db1, dW2 per block, then a "written" flag
     static_assert(CPAD >= 8 * NT2, "channel padding");
     static_assert(HP <= BWD_THREADS && (HPARTS == 1 || NTH <= 8), "db1: one thread per hidden unit of a part; second-part mask bits");
 };
@@ -800,6 +801,7 @@ __global__ void __launch_bounds__(BWD_THREADS, BWD_MIN_BLOCKS) backward_kernel(
     float accp[BS::MTA][BS::NIW][4] = {};   // p^T dh        -> dW1^T, hidden n-tiles of this warp
     float accg[BS::MT2][BS::NIW][4] = {};   // gm^T relu(h)  -> dW2
     float accb[BS::HPARTS] = {};            // sum of dh     -> db1, hidden unit threadIdx.x of each part
+    bool worked = false;                    // any updating pixel in this block's tiles (block-uniform)
     for (int tile = blockIdx.x * BWD_TILES_PER_BLOCK; tile < min(tiles, (blockIdx.x + 1) * BWD_TILES_PER_BLOCK); ++tile) {
         const int y0 = (tile / tiles_x) * TH, x0 = (tile % tiles_x) * TILE_W;
         typename Tile<C, TH>::template Regs<BWD_THREADS> xr;
@@ -831,6 +833,7 @@ __global__ void __launch_bounds__(BWD_THREADS, BWD_MIN_BLOCKS) backward_kernel(
         }
         if (count == 0)
             continue;
+        worked = true;
         sm.x.template store<BWD_THREADS>(xr);
         __syncthreads();
 
@@ -1018,44 +1021,58 @@ __global__ void __launch_bounds__(BWD_THREADS, BWD_MIN_BLOCKS) backward_kernel(
         }
     }
 
-    // ---- write this block's partial weight gradients: dW1 (HID x PIN), db1 (HID), dW2 (C x HID)
+    // ---- this block's partial weight gradients, if any: dW1 (HID x PIN), db1 (HID), dW2 (C x HID), flag
     float *out = partial + ((size_t)n * gridDim.x + blockIdx.x) * BS::PARTIAL;
-    if (threadIdx.x < BS::HP)
+    if (worked) {
+        if (threadIdx.x < BS::HP)
 #pragma unroll
-        for (int part = 0; part < BS::HPARTS; ++part)
-            out[HID * BS::PIN + part * BS::HP + threadIdx.x] = accb[part];
+            for (int part = 0; part < BS::HPARTS; ++part)
+                out[HID * BS::PIN + part * BS::HP + threadIdx.x] = accb[part];
 #pragma unroll
-    for (int q = 0; q < BS::NIW; ++q)
+        for (int q = 0; q < BS::NIW; ++q)
 #pragma unroll
-        for (int e = 0; e < 4; ++e) {
-            const int hid = 8 * BS::owned(warp, q) + 2 * t + e % 2;
+            for (int e = 0; e < 4; ++e) {
+                const int hid = 8 * BS::owned(warp, q) + 2 * t + e % 2;
 #pragma unroll
-            for (int mi = 0; mi < BS::MTA; ++mi) {
-                const int f = 16 * mi + g + 8 * (e / 2);  // K position of the feature
-                out[hid * BS::PIN + feature(f / 8, f % 8)] = accp[mi][q][e];
+                for (int mi = 0; mi < BS::MTA; ++mi) {
+                    const int f = 16 * mi + g + 8 * (e / 2);  // K position of the feature
+                    out[hid * BS::PIN + feature(f / 8, f % 8)] = accp[mi][q][e];
+                }
+#pragma unroll
+                for (int mi = 0; mi < BS::MT2; ++mi) {
+                    const int ch = 16 * mi + g + 8 * (e / 2);
+                    if (ch < C)
+                        out[HID * (BS::PIN + 1) + ch * HID + hid] = accg[mi][q][e];  // after dW1 and db1
+                }
             }
-#pragma unroll
-            for (int mi = 0; mi < BS::MT2; ++mi) {
-                const int ch = 16 * mi + g + 8 * (e / 2);
-                if (ch < C)
-                    out[HID * (BS::PIN + 1) + ch * HID + hid] = accg[mi][q][e];  // after dW1 and db1
-            }
-        }
+    }
+    if (threadIdx.x == 0)
+        out[BS::PARTIAL - 1] = worked;
 }
 
-// Sum the partials of each NCA's blocks in block order -> dw1 (K, HID, PIN), db1 (K, HID), dw2 (K, C, HID).
+// Sum the flagged partials of each NCA's blocks in block order -> dw1 (K, HID, PIN), db1 (K, HID), dw2 (K, C, HID).
 template <int C, int HID>
 __global__ void reduce_kernel(const float *__restrict__ partial, int blocks_per_nca, float *__restrict__ dw1,
                               float *__restrict__ db1, float *__restrict__ dw2)
 {
     using BS = BwdShape<C, HID>;
+    __shared__ uint8_t flags[1024];
     const int k = blockIdx.y, e = blockIdx.x * blockDim.x + threadIdx.x;
-    if (e >= BS::PARTIAL)
-        return;
-    const float *src = partial + (size_t)k * blocks_per_nca * BS::PARTIAL + e;
+    const float *src = partial + (size_t)k * blocks_per_nca * BS::PARTIAL;
     float s = 0.f;
-    for (int b = 0; b < blocks_per_nca; ++b)
-        s += src[(size_t)b * BS::PARTIAL];
+    for (int b0 = 0; b0 < blocks_per_nca; b0 += 1024) {
+        const int nb = min(1024, blocks_per_nca - b0);
+        __syncthreads();
+        for (int b = threadIdx.x; b < nb; b += blockDim.x)
+            flags[b] = src[(size_t)(b0 + b) * BS::PARTIAL + BS::PARTIAL - 1] != 0.f;
+        __syncthreads();
+        if (e < BS::PARTIAL - 1)
+            for (int b = 0; b < nb; ++b)
+                if (flags[b])
+                    s += src[(size_t)(b0 + b) * BS::PARTIAL + e];
+    }
+    if (e >= BS::PARTIAL - 1)
+        return;
     if (e < HID * BS::PIN)
         dw1[(size_t)k * HID * BS::PIN + e] = s;
     else if (e < HID * (BS::PIN + 1))
@@ -1066,49 +1083,52 @@ __global__ void reduce_kernel(const float *__restrict__ partial, int blocks_per_
 
 // dx = g (* a) + sum_o sum_f K_f(o) dp_{4c+f}(y - o), the transpose of the circular perception filters, over the
 // updating pixels' dp (pixel-major, (N, H, W, 4C); not written elsewhere). A block takes 32 consecutive pixels of an
-// image and all C channels: thread (pixel, c) reads the 4 features of channel c of the 9 neighbours (16-byte loads; the
-// C threads of a pixel read its 4C features contiguously); the sums go through shared memory so that dx is written
-// by rows.
+// image and all C channels: the 9 neighbours of each pixel (offset, or -1 if not updating) are found once, then thread
+// (pixel, c) reads the channel's 4 features of each updating neighbour (16-byte loads; the C threads of a pixel read
+// its 4C features contiguously); the sums go through shared memory so that dx is written by rows.
+constexpr int ADJ_PIX = 32;
 template <int C, bool ALIVE>
-__global__ void __launch_bounds__(32 * C) adjoint_kernel(const float *__restrict__ dp, const uint8_t *__restrict__ updating,
-                                                         const float *__restrict__ gy, const uint8_t *__restrict__ alive,
-                                                         float *__restrict__ gx, int H, int W)  // grid (pixels / 32, images)
+__global__ void __launch_bounds__(ADJ_PIX * C) adjoint_kernel(const float *__restrict__ dp, const uint8_t *__restrict__ updating,
+                                                            const float *__restrict__ gy, const uint8_t *__restrict__ alive,
+                                                            float *__restrict__ gx, int H, int W)  // grid (pixels / 32, images)
 {
-    __shared__ float sum[C][33];
-    const uint64_t n = blockIdx.y, plane = (uint64_t)H * W;
+    static_assert(ADJ_PIX * C >= 9 * ADJ_PIX, "one thread per (neighbour, pixel)");
+    __shared__ int nb[9][ADJ_PIX];
+    __shared__ float sum[C][ADJ_PIX + 1];
+    const size_t n = blockIdx.y, plane = (size_t)H * W, P0 = blockIdx.x * (size_t)ADJ_PIX;
+    const float *dpn = dp + n * plane * 4 * C;
+    if (threadIdx.x < 9 * ADJ_PIX) {  // neighbour j = (dy, dx) of pixel i: its offset in the image if it updates, else -1
+        const int j = threadIdx.x / ADJ_PIX, i = threadIdx.x % ADJ_PIX, P = P0 + i;
+        int q = -1;
+        if (P < plane) {
+            q = wrap(P / W + 1 - j / 3, H) * W + wrap(P % W + 1 - j % 3, W);
+            q = updating[n * plane + q] ? q : -1;
+        }
+        nb[j][i] = q;
+    }
+    __syncthreads();
     {
         const int c = threadIdx.x % C, i = threadIdx.x / C;
-        const uint64_t P = blockIdx.x * 32ull + i;
         float v = 0.f;
-        if (P < plane) {
-            const int Y = P / W, X = P % W;
 #pragma unroll
-            for (int dy = 0; dy < 3; ++dy) {
-                int yy = Y + 1 - dy;
-                yy = yy < 0 ? yy + H : (yy >= H ? yy - H : yy);
+        for (int j = 0; j < 9; ++j) {
+            const int q = nb[j][i];
+            if (q < 0)
+                continue;
+            const float4 d = __ldg(reinterpret_cast<const float4 *>(dpn + (size_t)q * 4 * C) + c);
+            const float f[4] = {d.x, d.y, d.z, d.w};
 #pragma unroll
-                for (int dx = 0; dx < 3; ++dx) {
-                    int xx = X + 1 - dx;
-                    xx = xx < 0 ? xx + W : (xx >= W ? xx - W : xx);
-                    const uint64_t q = n * plane + (uint64_t)yy * W + xx;
-                    if (updating[q]) {
-                        const float4 d = __ldg(reinterpret_cast<const float4 *>(dp + q * 4 * C) + c);
-                        const float f[4] = {d.x, d.y, d.z, d.w};
-#pragma unroll
-                        for (int k = 0; k < 4; ++k)
-                            if (filter_tap(k, 3 * dy + dx) != 0.f)
-                                v = fmaf(filter_tap(k, 3 * dy + dx), f[k], v);
-                    }
-                }
-            }
+            for (int k = 0; k < 4; ++k)
+                if (filter_tap(k, j) != 0.f)
+                    v = fmaf(filter_tap(k, j), f[k], v);
         }
         sum[c][i] = v;
     }
     __syncthreads();
-    const int i = threadIdx.x % 32, c = threadIdx.x / 32;
-    const uint64_t P = blockIdx.x * 32ull + i;
+    const int i = threadIdx.x % ADJ_PIX, c = threadIdx.x / ADJ_PIX;
+    const size_t P = P0 + i;
     if (P < plane) {
-        const uint64_t o = (n * C + c) * plane + P;
+        const size_t o = (n * C + c) * plane + P;
         gx[o] = (ALIVE && !alive[n * plane + P] ? 0.f : gy[o]) + sum[c][i];
     }
 }
