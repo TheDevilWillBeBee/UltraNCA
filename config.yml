@@ -1,0 +1,30 @@
+targets: data/pbr_textures              # directory of target images (.png / .jpg), see prepare/download_pbr.py; relative paths are relative to this file
+out_dir: runs/pbr                        # one <image name>.pt (+ .png preview) per target, log.json, config.yml
+# initial weights: null (random: nn.Conv2d default for w1 / b1, zero w2), a .pt shared by all targets, or a directory
+# with one <image name>.pt per target (vanilla NCA format: w1.weight (96, 48, 1, 1), w1.bias (96,), w2.weight (12, 96, 1, 1))
+init: null
+img_size: 128
+seed: 0
+
+nca:
+  channels: 12
+  hidden: 96
+  update_rate: 0.5
+
+train:
+  group_size: 24        # NCAs (targets) trained together in one forward / backward pass
+  batch_size: 2         # pool samples per NCA per iteration
+  iterations: 768
+  pool_size: 64
+  lr: 1.0e-3
+  milestones: [256, 512]
+  gamma: 0.5
+  rollout: [32, 96]     # rollout length drawn per iteration from [low, high)
+  inject_every: 16      # replace the first sample of each NCA's batch by the zero seed every n iterations
+  overflow_weight: 10.0
+  tf32: true            # TF32 matmuls: ~1.3x faster rollouts on A100 at the same quality
+  impl: cuda            # NCA step: eager | compile | triton (nca_triton.py) | cuda (ncaops/, build with ncaops/build.sh)
+  compile_loss: true    # torch.compile the OT loss (~2x faster loss; ~30 s compile)
+
+loss:
+  n_samples: 1024       # feature positions per layer in the OT loss

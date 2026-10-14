@@ -1,0 +1,6 @@
+__pycache__/
+*.so
+ncaops/build/
+data/
+runs/
+.ipynb_checkpoints/
