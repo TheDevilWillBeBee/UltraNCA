@@ -34,9 +34,6 @@ namespace nca_step {
 #ifndef NCA_FWD_RING
 #define NCA_FWD_RING 26
 #endif
-#ifndef NCA_BWD_TILE_H
-#define NCA_BWD_TILE_H 7
-#endif
 #ifndef NCA_BWD_TILES_PER_BLOCK
 #define NCA_BWD_TILES_PER_BLOCK 8
 #endif
@@ -240,60 +237,41 @@ struct Tile {
     __device__ __forceinline__ float at(int c, int row, int col) const { return v[c][row * HALO_W + col]; }
 
     // The tile at (y0, x0) of an image (CH channel planes of H x W) with circular wrap, loaded by THREADS threads in
-    // two steps (other work overlaps the loads): fetch() into registers, store() into the tile. Thread i < MAIN holds
-    // halo pixel (i / 16, i % 16) in every channel; the other halo pixels (the last two columns, then the rows past
-    // MAIN / 16) are the elements i, i + THREADS, ... of the remainder.
-    static constexpr int ROWS = TH + 2;
+    // two steps (other work overlaps the loads): fetch() into registers, store() into the tile. Thread i holds halo
+    // pixel (i / 16, i % 16) in every channel, and elements i, i + THREADS, ... of the last two halo columns.
+    static constexpr int ROWS = TH + 2, EXTRA = CH * ROWS * 2;
     template <int THREADS>
-    struct Split {
-        static constexpr int MAIN = ROWS * TILE_W < THREADS ? ROWS * TILE_W : THREADS;  // pixels of the main part
-        static constexpr int EXTRA = CH * (ROWS * HALO_W - MAIN), NX = (EXTRA + THREADS - 1) / THREADS;
-        __device__ __forceinline__ static void extra(int e, int &c, int &row, int &col)  // element e of the remainder
-        {
-            c = e / (ROWS * HALO_W - MAIN);
-            const int i = e % (ROWS * HALO_W - MAIN);
-            if (i < 2 * ROWS) { row = i / 2; col = TILE_W + i % 2; }
-            else { row = MAIN / TILE_W + (i - 2 * ROWS) / TILE_W; col = (i - 2 * ROWS) % TILE_W; }
-        }
-    };
-    template <int THREADS>
-    using Regs = float[CH + Split<THREADS>::NX];
+    using Regs = float[CH + (EXTRA + THREADS - 1) / THREADS];
     template <int THREADS>
     __device__ __forceinline__ void fetch(Regs<THREADS> &r, const float *__restrict__ x, int H, int W, int y0, int x0) const
     {
-        using SP = Split<THREADS>;
         const int i = threadIdx.x;
-        if (i < SP::MAIN) {
+        if (i < ROWS * TILE_W) {
             const float *p = x + (size_t)wrap(y0 - 1 + i / TILE_W, H) * W + wrap(x0 - 1 + i % TILE_W, W);
 #pragma unroll
             for (int c = 0; c < CH; ++c)
                 r[c] = __ldcg(p + (size_t)c * H * W);
         }
 #pragma unroll
-        for (int k = 0; k < SP::NX; ++k) {
-            const int e = i + k * THREADS;
-            int c, row, col;
-            SP::extra(e, c, row, col);
-            if (e < SP::EXTRA)
+        for (int k = 0; k < (EXTRA + THREADS - 1) / THREADS; ++k) {
+            const int e = i + k * THREADS, c = e / (2 * ROWS), row = e / 2 % ROWS, col = TILE_W + e % 2;
+            if (e < EXTRA)
                 r[CH + k] = __ldcg(x + ((size_t)c * H + wrap(y0 - 1 + row, H)) * W + wrap(x0 - 1 + col, W));
         }
     }
     template <int THREADS>
     __device__ __forceinline__ void store(const Regs<THREADS> &r)
     {
-        using SP = Split<THREADS>;
         const int i = threadIdx.x;
-        if (i < SP::MAIN)
+        if (i < ROWS * TILE_W)
 #pragma unroll
             for (int c = 0; c < CH; ++c)
                 at(c, i / TILE_W, i % TILE_W) = r[c];
 #pragma unroll
-        for (int k = 0; k < SP::NX; ++k) {
+        for (int k = 0; k < (EXTRA + THREADS - 1) / THREADS; ++k) {
             const int e = i + k * THREADS;
-            int c, row, col;
-            SP::extra(e, c, row, col);
-            if (e < SP::EXTRA)
-                at(c, row, col) = r[CH + k];
+            if (e < EXTRA)
+                at(e / (2 * ROWS), e / 2 % ROWS, TILE_W + e % 2) = r[CH + k];
         }
     }
 
@@ -689,12 +667,10 @@ __global__ void alive_kernel(const float *__restrict__ x, const float *__restric
 // adjoint_kernel then forms dx = g + sum_f K_f^T * dp_f (transpose of the circular 3x3 filters).
 constexpr int BWD_WARPS = 4, BWD_THREADS = 32 * BWD_WARPS;
 constexpr int BWD_PIX = BWD_WARPS * TILE_W;  // pixels of a round
-// rows of a block tile: 4 (one round) when every pixel updates, else NCA_BWD_TILE_H (7 at update rate 0.5: ~56
-// updating pixels, one round that keeps all four warps busy; the weight-gradient MMAs skip the empty pixel slots),
-// or 6 for growing NCAs (fewer updating pixels per tile; measured)
-__host__ __device__ constexpr int bwd_tile_h(bool stoch, bool alive) { return !stoch ? 4 : alive ? 6 : NCA_BWD_TILE_H; }
-constexpr int BWD_TILE_H_MAX = bwd_tile_h(true, false) > bwd_tile_h(true, true) ? bwd_tile_h(true, false) : bwd_tile_h(true, true);
-static_assert(BWD_TILE_H_MAX * TILE_W <= BWD_THREADS && BWD_TILE_H_MAX <= 8, "one thread per pixel, one Philox block per lane");
+// rows of a block tile: 4 (one round) when every pixel updates, else 6 (update rate 0.5: ~48 updating pixels,
+// almost always one round; the weight-gradient MMAs skip the empty pixel slots of a round)
+__host__ __device__ constexpr int bwd_tile_h(bool stoch) { return stoch ? 6 : 4; }
+static_assert(bwd_tile_h(true) * TILE_W <= BWD_THREADS && bwd_tile_h(true) <= 8, "one thread per pixel, one Philox block per lane");
 constexpr int BWD_TILES_PER_BLOCK = NCA_BWD_TILES_PER_BLOCK;  // tiles of one image per block (amortises accumulator write-out)
 constexpr int BWD_MIN_BLOCKS = NCA_BWD_MIN_BLOCKS;            // resident blocks per SM (register bound via __launch_bounds__)
 constexpr int BWD_UNROLL = NCA_BWD_UNROLL;                    // unrolling of the per-hidden-tile dh / dp loop (registers)
@@ -715,7 +691,7 @@ struct BwdShape {
     // shared memory of BackwardSmem (largest tile) when relu(h) and dh are staged in `parts` parts
     __host__ __device__ static constexpr size_t smem(int parts)
     {
-        return sizeof(Tile<C, BWD_TILE_H_MAX>) + 4 * BWD_PIX * (PIN + HID / parts + CPAD) + TILE_W * BWD_TILE_H_MAX;
+        return sizeof(Tile<C, bwd_tile_h(true)>) + 4 * BWD_PIX * (PIN + HID / parts + CPAD) + TILE_W * bwd_tile_h(true);
     }
     // relu(h) and dh are staged for the weight gradients in HPARTS parts of the hidden units when all of them do not
     // fit BWD_MIN_BLOCKS blocks per SM (16 / 128 on sm_89). With two parts, relu(h)'s second part goes to the p buffer
@@ -796,7 +772,7 @@ struct BackwardSmem {
     Staged<BWD_PIX, BS::PIN> p;          // p (K order of feature()); with two parts first relu(h) (second part)
     Staged<BWD_PIX, BS::HP> h;           // relu(h) (first part), later dh (one part at a time)
     Staged<BWD_PIX, BS::CPAD> gm;        // g * m (channels zero-padded)
-    uint8_t pixels[TILE_W * BWD_TILE_H_MAX];    // the updating pixels of a tile (16 row + column), in order
+    uint8_t pixels[TILE_W * bwd_tile_h(true)];  // the updating pixels of a tile (16 row + column), in order
 };
 
 template <bool FP32>
@@ -812,8 +788,8 @@ __global__ void __launch_bounds__(BWD_THREADS, BWD_MIN_BLOCKS) backward_kernel(
     float *__restrict__ partial, int n0, int B, int H, int W, uint64_t seed, float update_rate)
 {
     using BS = BwdShape<C, HID>;
-    constexpr int TH = bwd_tile_h(STOCH, ALIVE), TPIX = TH * TILE_W, WORDS = (TPIX + 31) / 32;
-    static_assert(sizeof(BackwardSmem<C, HID, BWD_TILE_H_MAX>) == BS::smem(BS::HPARTS), "BwdShape::smem()");
+    constexpr int TH = bwd_tile_h(STOCH), TPIX = TH * TILE_W, WORDS = (TPIX + 31) / 32;
+    static_assert(sizeof(BackwardSmem<C, HID, bwd_tile_h(true)>) == BS::smem(BS::HPARTS), "BwdShape::smem()");
     extern __shared__ __align__(16) unsigned char smem_raw[];
     auto &sm = *reinterpret_cast<BackwardSmem<C, HID, TH> *>(smem_raw);
 
