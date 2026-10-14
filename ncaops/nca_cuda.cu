@@ -179,9 +179,9 @@ void rollout(FloatArray4D x, FloatArray3D w1, FloatArray2D b1, FloatArray3D w2, 
     }
 }
 
-static int backward_blocks_per_image(int H, int W)
+static int backward_blocks_per_image(int H, int W, bool stoch)
 {
-    const int tiles = ceil_div(W, nca_step::TILE_W) * ceil_div(H, nca_step::BWD_TILE_H);
+    const int tiles = ceil_div(W, nca_step::TILE_W) * ceil_div(H, nca_step::bwd_tile_h(stoch));
     return ceil_div(tiles, nca_step::BWD_TILES_PER_BLOCK);
 }
 
@@ -218,16 +218,17 @@ static void join(cudaStream_t waiter, cudaStream_t stream)
 }
 
 // Workspace sizes for backward(): (packed weight bytes per NCA, partial floats per image, images per chunk).
-std::tuple<size_t, size_t, size_t> backward_workspace(size_t C, size_t HID, bool fp32, size_t N, size_t H, size_t W)
+std::tuple<size_t, size_t, size_t> backward_workspace(size_t C, size_t HID, bool fp32, size_t N, size_t H, size_t W,
+                                                      float update_rate)
 {
-    return dispatch(C, HID, fp32, true, false, [&](auto I) {
+    return dispatch(C, HID, fp32, update_rate < 1.f, false, [&](auto I) {
         using D = decltype(I);
         auto kernel = nca_step::backward_kernel<D::C, D::HID, D::FP32, D::STOCH, D::ALIVE>;
-        constexpr int smem = sizeof(nca_step::BackwardSmem<D::C, D::HID>);
+        constexpr int smem = sizeof(nca_step::BackwardSmem<D::C, D::HID, nca_step::bwd_tile_h(D::STOCH)>);
         set_smem(kernel, smem);
         int blocks_per_sm;
         cuda_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, kernel, nca_step::BWD_THREADS, smem));
-        const int blocks = backward_blocks_per_image(H, W);
+        const int blocks = backward_blocks_per_image(H, W, D::STOCH);
         return std::make_tuple(sizeof(nca_step::BackwardWeights<D::C, D::HID, D::FP32>),
                                (size_t)blocks * nca_step::BwdShape<D::C, D::HID>::PARTIAL,
                                chunk_images(N, C, H, W, blocks, blocks_per_sm));
@@ -251,7 +252,7 @@ void backward(FloatArray4D x, FloatArray4D gy, ByteArray3D alive, FloatArray3D w
     validate_array_shape(db1, {K, HID}, "db1");
     validate_array_shape(w2, {K, C, HID}, "w2");
     validate_array_shape(dw2, {K, C, HID}, "dw2");
-    const auto workspace = backward_workspace(C, HID, fp32, N, H, W);
+    const auto workspace = backward_workspace(C, HID, fp32, N, H, W, update_rate);
     const size_t packed_bytes = std::get<0>(workspace), partial_floats = std::get<1>(workspace);
     // dp: N images (one launch on `stream`), or two chunks of dp.shape[0] / 2 images (alternating side streams)
     const size_t chunk = dp.shape(0) >= N ? N : dp.shape(0) / 2;
@@ -271,9 +272,9 @@ void backward(FloatArray4D x, FloatArray4D gy, ByteArray3D alive, FloatArray3D w
         cuda_check(cudaGetLastError());
 
         auto kernel = nca_step::backward_kernel<D::C, D::HID, D::FP32, D::STOCH, D::ALIVE>;
-        constexpr int smem = sizeof(nca_step::BackwardSmem<D::C, D::HID>);
+        constexpr int smem = sizeof(nca_step::BackwardSmem<D::C, D::HID, nca_step::bwd_tile_h(D::STOCH)>);
         set_smem(kernel, smem);
-        const int blocks = backward_blocks_per_image(H, W);
+        const int blocks = backward_blocks_per_image(H, W, D::STOCH);
         const size_t plane = H * W;
         const bool split = chunk < N;
         if (split)
@@ -322,7 +323,7 @@ NB_MODULE(nca_cuda, m)
           "batch_per_nca"_a, "seed"_a, "update_rate"_a, "fp32"_a, "growing"_a, "stream"_a,
           "`steps` forward steps from x into y (tmp: workspace like x if steps > 1), with the step seeds derived from "
           "`seed`; no gradients.");
-    m.def("backward_workspace", &backward_workspace, "channels"_a, "hidden"_a, "fp32"_a, "N"_a, "H"_a, "W"_a,
+    m.def("backward_workspace", &backward_workspace, "channels"_a, "hidden"_a, "fp32"_a, "N"_a, "H"_a, "W"_a, "update_rate"_a,
           "(packed weight bytes per NCA, partial floats per image, images of dp) for backward().");
     m.def("backward", &backward, "x"_a, "gy"_a, "alive"_a, "w1"_a, "b1"_a, "w2"_a, "gx"_a, "dw1"_a, "db1"_a, "dw2"_a,
           "packed"_a, "dp"_a, "partial"_a, "batch_per_nca"_a, "seed"_a, "update_rate"_a, "fp32"_a, "growing"_a, "stream"_a,

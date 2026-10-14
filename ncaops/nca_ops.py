@@ -32,7 +32,7 @@ class _Step(torch.autograd.Function):
     def backward(ctx, gy):
         x, w1, b1, w2, alive = ctx.saved_tensors
         K, B, C, H, W = x.shape
-        packed_bytes, partial_floats, chunk = nca_cuda.backward_workspace(C, w1.shape[1], ctx.fp32, K * B, H, W)
+        packed_bytes, partial_floats, chunk = nca_cuda.backward_workspace(C, w1.shape[1], ctx.fp32, K * B, H, W, ctx.update_rate)
         packed = torch.empty(K * packed_bytes, dtype=torch.uint8, device=x.device)
         partial = torch.empty(K * B * partial_floats, device=x.device)
         chunk = CHUNK or chunk

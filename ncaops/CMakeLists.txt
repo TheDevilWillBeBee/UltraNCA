@@ -27,7 +27,7 @@ nanobind_add_module(nca_cuda nca_cuda.cu)
 # whole-program device compilation: no relocatable-code register limits
 set_property(TARGET nca_cuda PROPERTY CUDA_SEPARABLE_COMPILATION OFF)
 target_compile_options(nca_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=-v>)
-# tuning overrides, e.g. cmake -DNCA_DEFS="-DNCA_TILE_H=4"
+# per-GPU configuration and tuning overrides (see nca_step.cuh), e.g. cmake -DNCA_DEFS="-DNCA_SMEM_PER_SM_KB=164"
 if (NCA_DEFS)
   separate_arguments(NCA_DEFS_LIST UNIX_COMMAND "${NCA_DEFS}")
   target_compile_options(nca_cuda PRIVATE ${NCA_DEFS_LIST})
