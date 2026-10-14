@@ -107,15 +107,15 @@ All matmuls use `mma.sync.m16n8k8` TF32; a warp computes 16 pixels at a time (th
 | kernel | what it does |
 |---|---|
 | `forward_kernel` | A block sweeps a 16-pixel-wide column strip (a segment of rows) of an image: state rows go into a ring in shared memory (loads of the next phase issued before the current matmuls), the pixels that do not update copy x, and the updating ones are queued; every 128 queued pixels each of the 8 warps runs perception → h → relu → u on 16 of them. Weights are staged once per block in fragment-major order; h stays in registers between the two matmuls (permuted hidden index). Growing NCAs: rows and segments without a living cell within 2 pixels are skipped. |
-| `alive_kernel` | growing NCAs: alive mask from the old and new alpha (3×3 max-pools), y ×= mask, mask stored for the backward |
+| `alive_kernel` | growing NCAs: alive mask from the old and new alpha (3×3 max-pools), y ×= mask, mask stored for the backward; inference rollouts keep a mask per ping-pong buffer and skip cells already known to be zero |
 | `pack_kernel` | per-NCA weights → B fragments for the backward matmuls |
 | `backward_kernel` | Per tile (6 rows × 16 when stochastic, else 4 × 16), the updating pixels in rounds of 4 groups of 16: recompute p and h; stage p, relu(h) and g·m in shared memory; dW2 += (g·m)ᵀ relu(h); then per hidden n-tile dh = (g·m)W2·[h>0] (the sign read back from the lane's own staged relu(h)) → dp += dh W1, dh staged; dW1 += pᵀ dh and db1 += column sums of the staged dh (fixed order). Weight-gradient MMAs cover only the occupied k-steps of 8 pixels. 16/128 on 100 KB GPUs stages relu(h) / dh in two halves (2 blocks per SM). dp is pixel-major (N, H, W, 4C) and written only at updating pixels (full 32-byte sectors), which an updating-pixel map marks. Weight B fragments are read in 16-byte pairs. A block without an updating pixel (dead region of a growing NCA) writes no partial (a flag marks the written ones). |
 | `reduce_kernel` | sums the flagged per-block partial weight gradients per NCA in a fixed order |
-| `adjoint_kernel` | dx = g(·a) + Σ_f K_fᵀ ⋆ dp_f (transpose of the circular 3×3 filters) over the updating pixels' dp: the 9 neighbours of a pixel (offset or "not updating") are found once per pixel, then a thread per (pixel, pair of channels) reads its channels' 4 features of each updating neighbour (16-byte loads, 18 in flight); results transposed through shared memory for row-wise dx stores |
+| `adjoint_kernel` | dx = g(·a) + Σ_f K_fᵀ ⋆ dp_f (transpose of the circular 3×3 filters) over the updating pixels' dp: a block covers 4 × 32 pixels; neighbour offsets are shared across channels, and a thread per (column, pair of channels) reuses each 16-byte feature load across up to three output rows, preserving tap order; results transposed through shared memory for row-wise dx stores |
 
 The backward and adjoint run in chunks of images on two streams so that dp stays in L2: a chunk's backward is about two thirds of a wave of resident blocks (room for the other stream's adjoint); growing NCAs, whose blocks mostly have nothing to do, use at least N / 4 images per chunk. Inference (`nca_ops.rollout`) loops over steps in C++.
 
-**Per-GPU configuration.** The top of `nca_step.cuh` has one hardware constant, `NCA_SMEM_PER_SM_KB` (shared memory per SM: A100 164, RTX 30xx / 40xx 100, H100 228), which `build.sh` sets from the compute capability of the machine's GPU. Blocks per SM (forward) and the backward staging layout (one or two parts) derive from it; the L2 size (backward chunks), SM count and occupancy (forward segment length) are queried at run time. The remaining knobs (`NCA_FWD_WARPS`, `NCA_FWD_RING`, `NCA_BWD_TILES_PER_BLOCK`, `NCA_BWD_UNROLL`, `NCA_BWD_MIN_BLOCKS`, `NCA_ADJ_CPT`) are tuning choices measured on sm_89; on another GPU, rebuild and optionally sweep them, e.g. `bash ncaops/build.sh "-DNCA_FWD_RING=20 -DNCA_BWD_TILES_PER_BLOCK=4"`.
+**Per-GPU configuration.** The top of `nca_step.cuh` has one hardware constant, `NCA_SMEM_PER_SM_KB` (shared memory per SM: A100 164, RTX 30xx / 40xx 100, H100 228), which `build.sh` sets from the compute capability of the machine's GPU. Blocks per SM (forward) and the backward staging layout (one or two parts) derive from it; the L2 size (backward chunks), SM count and occupancy (forward segment length) are queried at run time. The remaining knobs (`NCA_FWD_WARPS`, `NCA_FWD_RING`, `NCA_BWD_TILES_PER_BLOCK`, `NCA_BWD_UNROLL`, `NCA_BWD_MIN_BLOCKS`, `NCA_ADJ_CPT`, `NCA_ADJ_ROWS`) are tuning choices measured on sm_89; on another GPU, rebuild and optionally sweep them, e.g. `bash ncaops/build.sh "-DNCA_FWD_RING=20 -DNCA_BWD_TILES_PER_BLOCK=4"`.
 
 Correctness (`ncaops/testing/test_nca.py`, against PyTorch autograd with the same mask, for both sizes, update rate 0.5 / 1, texture / growing, partial tiles; also determinism, chunked backward and rollout = repeated steps):
 
@@ -190,10 +190,50 @@ The texture step gained less than its kernels: the adjoint used to run largely i
 - a 240-register cap on the backward so that small adjoint blocks can co-reside (one block per SM is far too little memory parallelism), streaming cache hints on the backward's x / gy loads (the halo rows are re-read by the next tile row), 16 tiles per block (backward +13, reduce −23 µs), 7-row tiles (all four warps busy in one round: −2–3 % on texture, within the noise, and +6 % on growing);
 - OT loss: cuDNN 9.2 runs a `convertTensor` pass (TF32 rounding of the input) before every TF32 convolution and its gradient, 3.9 of the 40 ms; `cudnn.benchmark`, `allow_tf32 = False`, inductor's Triton convolutions (`max-autotune`) and the input gradient as a forward convolution with the transposed weights are no faster.
 
+### 7. RTX 4090 frontier round (2026-10-15)
+
+Baseline: `54436bc`; optimized kernels/loss: `67ddaa9`. TF32 NCA math, FP32 VGG (the default), B = 2, 128² training grids. The following are medians of three interleaved baseline/optimized runs of `python benchmark.py train infer --K 32 64`, with the CPU/CUDA RNG seeded to 0 and the same trained growing weights from `runs/emoji`. Compilation and warmup are excluded. Small differences of a few percent should be read with the run-to-run variation in mind.
+
+| 64-step training iteration | before (ms) | after (ms) |
+|---|---|---|
+| texture, K = 32 | 97.3 | 95.3 |
+| texture, K = 64 | 190.9 | 181.9 |
+| growing, K = 32 | 39.7 | 39.8 |
+| growing, K = 64 | 84.3 | 80.8 |
+
+Growing inference, 256 steps from the single-cell seed:
+
+| workload | before (ms) | after (ms) | speedup |
+|---|---|---|---|
+| K = 32, 64² | 9.65 | 9.41 | 1.03× |
+| K = 32, 128² | 20.33 | 16.75 | 1.21× |
+| K = 64, 64² | 16.51 | 15.46 | 1.07× |
+| K = 64, 128² | 49.90 | 33.92 | 1.47× |
+| K = 1, 512² | 9.05 | 6.88 | 1.32× |
+| K = 1, 1024² | 29.60 | 9.52 | 3.11× |
+| K = 1, 2048² | 110.75 | 14.14 | **7.83×** |
+
+Texture inference is essentially unchanged (e.g. K = 1, 2048²: 145.98 → 145.90 ms). A small 512² regression in the separate-process sweep disappeared with alternating calls on identical buffers in one process (10.519 → 10.512 ms); the texture forward has identical generated instructions after adjusting kernel-parameter offsets. All measured sizes and individual repetitions are in the local `runs/frontier/benchmark-report.json` and `final-*.txt` artifacts.
+
+Three retained changes:
+- **Sparse growing rollouts:** keep one alive map for each ping-pong destination. A forward write marks that destination cell dirty. After the first two steps have initialized both destinations, a clean cell is already zero and has no old living neighbour, so the alive kernel skips both its neighbourhood scan and zero stores. Dirty dead cells are still cleared. This handles arbitrary initial states and dying patterns, without a fixed bounding box. The extra workspace is one byte per cell; single-step training still initializes its output normally.
+- **Adjoint row reuse:** a block covers four output rows. Each thread reuses a neighbour's four features across up to three of those rows, with the original tap accumulation order. Interleaved 64-step rollout microbenchmarks improved about 2–3%; the full training gain depends on overlap and the loss. The adjoint uses 44 / 48 registers for 12 / 16 channels, with no spills. `NCA_ADJ_ROWS` is a tuning knob alongside `NCA_ADJ_CPT`.
+- **Compiled VGG pooling:** non-overlapping 2×2 max-pools save a uint8 position within the window, then form the backward directly without int64 indices or atomics. First-maximum and last-NaN behavior match PyTorch. Eager execution and odd dimensions retain the original pooling. The isolated compiled loss measured about 41.1 → 38.3 ms at 64 images; the whole-loop gain is smaller. NCA precision is unchanged; bf16 VGG remains opt-in.
+
+**Training quality and full training time.** Both versions trained the first 32 PBR textures and first 32 emojis for all 768 iterations, seed 0, with the config schedules and random initialization. Texture group time was 73.17 → 70.96 s (first iteration excluded); growing was 57.36 → 56.74 s, effectively unchanged. The first growing baseline timing overlapped a diagnostic and was discarded; the reported baseline is an isolated rerun.
+
+For textures, the median final training-loss ratio was 0.9962. Evaluation from the seed over three independent 256-step rollouts, using FP32 VGG and matched feature-sampling seeds, gave median per-target loss ratio **1.0008** and ratio of mean losses **0.9853**. Side-by-side previews showed no visible regression. All 32 growing models had **bitwise-identical weights** and identical evaluation losses. Several growing targets remain undergrown under this short random-initialization schedule in both versions. Checkpoints, per-target metrics, configs and preview contact sheets are saved locally under `runs/frontier/`.
+
+Validation:
+- `python ncaops/testing/test_nca.py` passes, including the extended rollout checks: both model sizes and precisions, rates 0 / 0.5 / 1, stochastic step seeds, partial tiles, unchanged inputs, and reused buffers whose patterns die.
+- `python ncaops/testing/test_loss.py` verifies exact pooled values and gradients against PyTorch in float32 and bf16, both layouts, ties, infinities and NaNs.
+
+Rejected experiment: staging a complete 16×4 adjoint tile and its feature halo in shared memory passed correctness but made the adjoint about 40% slower; it was removed. CUDA graph replay of the existing rollout showed only a small additional gain, so no graph-specific training path was added.
+
 ## Planned next steps (in rough order of expected gain)
 
 1. **Backward occupancy / latency**: 255 registers and ~47 KB of shared memory per 4-warp block give 8 warps per SM, and the kernel issues every 9 cycles per warp (stalls: tensor pipe 2.4, weight-fragment loads 2.0, dependencies 1.7, barriers 1.6 cycles per instruction). On the A100 / H100 (164 / 228 KB), an 8-warp block of two 4-warp teams with the weight fragments resident in shared memory (~140 KB) would remove the fragment-load stalls; it does not fit 100 KB. Tried and dropped: two warps per pixel group (8-warp blocks at 128 registers, 16 warps per SM): twice the instructions per MMA, 15–30 % slower; a 168-register cap (spills).
 2. **Fusing the adjoint** stays a loss on 100 KB GPUs (see above); with 164 KB or more, the gather could stage a tile's dp in shared memory instead of reading it 9 times from L2.
-3. **OT loss** (40 ms of a 93 ms texture iteration): the max-pool backward reads int64 indices (2.5 ms; a backward that recomputes the argmax from the saved input would halve it), the gradient of the 1024 sampled feature positions is materialized as a dense scatter per layer (~1 ms), and the cuDNN TF32 conversion passes (3.9 ms) would only go away with a different convolution implementation; bf16 VGG (validated, opt-in) halves the whole loss.
-4. **Sparse growing grids**: skip the zero writes of dead cells (e.g. track the live bounding box) for very large, mostly empty grids.
+3. **OT loss** (40 ms of a 93 ms texture iteration): the pooling index traffic is reduced in section 7; the gradient of the 1024 sampled feature positions is still materialized as a dense scatter per layer (~1 ms), and the cuDNN TF32 conversion passes (3.9 ms) would only go away with a different convolution implementation; bf16 VGG (validated, opt-in) halves the whole loss.
+4. **Sparse growing grids**: redundant clearing and alive-mask scans are removed in section 7; the forward still scans all strips for living cells. Tracking active tiles could reduce this remaining cost on very large, mostly empty grids.
 5. **Other GPUs**: H100 `wgmma`; other (C, HID) instantiations (`dispatch()` in `nca_cuda.cu`; C a multiple of 4, HID a multiple of 32).
