@@ -1,5 +1,6 @@
 task: texture                            # texture | growing (config_growing.yml)
 targets: data/pbr_textures              # directory of target images (.png / .jpg), see prepare/download_pbr.py; relative paths are relative to this file
+num_targets: 64                          # the first n targets (sorted by name); null: all
 out_dir: runs/pbr                        # one <image name>.pt (+ .png preview) per target, log.json, config.yml
 # initial weights: null (random: nn.Conv2d default for w1 / b1, zero w2), a .pt shared by all targets, or a directory
 # with one <image name>.pt per target (vanilla NCA format: w1.weight (96, 48, 1, 1), w1.bias (96,), w2.weight (12, 96, 1, 1))
@@ -14,7 +15,7 @@ nca:
   update_rate: 0.5
 
 train:
-  group_size: 24        # NCAs (targets) trained together in one forward / backward pass
+  group_size: 32        # NCAs (targets) trained together in one forward / backward pass
   batch_size: 2         # pool samples per NCA per iteration
   iterations: 768
   pool_size: 64

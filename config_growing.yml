@@ -1,5 +1,6 @@
 task: growing                            # growing NCA (Distill "Growing Neural Cellular Automata"); see config.yml for texture
 targets: data/emoji                      # RGBA .png targets, see prepare/download_emoji.py
+num_targets: 64                          # the first n targets (sorted by name); null: all
 out_dir: runs/emoji
 init: null                               # as in config.yml
 img_size: 40                             # target size; the grid is img_size + 2 * pad

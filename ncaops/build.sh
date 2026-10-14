@@ -7,5 +7,5 @@ export PATH=$CUDA_HOME/bin:$PATH
 rm -rf build && mkdir build && cd build
 cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_COMPILER=$CUDA_HOME/bin/nvcc -DNCA_DEFS="$1" .. > /dev/null
 cmake --build . --config Release -j"$(nproc)" 2>&1 | grep -E "error|warning|registers|spill|bytes stack" || true
-cp nca_cuda.cpython-3*.so ..
+for f in nca_cuda.cpython-3*.so; do cp "$f" "../$f.tmp" && mv -f "../$f.tmp" "../$f"; done  # new inode: running processes keep theirs
 cd .. && rm -rf build

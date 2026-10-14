@@ -42,14 +42,8 @@ static_assert(TILE_H % WARPS == 0, "Rows of a tile are split evenly over the war
 
 constexpr int HALO_W = TILE_W + 2, HALO_H = TILE_H + 2;
 
-// identity, sobel_x, sobel_x^T, laplacian (cross-correlation taps, row-major dy, dx in -1..1)
-__constant__ float FILTERS[4][9] = {
-    {0, 0, 0, 0, 1, 0, 0, 0, 0},
-    {-1, 0, 1, -2, 0, 2, -1, 0, 1},
-    {-1, -2, -1, 0, 0, 0, 1, 2, 1},
-    {1, 2, 1, 2, -12, 2, 1, 2, 1},
-};
-// the same taps as a compile-time function (fully unrolled loops drop the zero taps)
+// identity, sobel_x, sobel_x^T, laplacian (cross-correlation taps, row-major dy, dx in -1..1); fully unrolled loops
+// drop the zero taps
 __device__ __forceinline__ constexpr float filter_tap(int f, int i)
 {
     constexpr float taps[4][9] = {{0, 0, 0, 0, 1, 0, 0, 0, 0}, {-1, 0, 1, -2, 0, 2, -1, 0, 1},
@@ -57,13 +51,24 @@ __device__ __forceinline__ constexpr float filter_tap(int f, int i)
     return taps[f][i];
 }
 
+// smallest stride >= n with stride % 32 in {8, 24}: lanes (g, t) reading [8k + t][g] hit 32 distinct banks
+constexpr int conflict_free_stride(int n)
+{
+    return (n % 32 == 8 || n % 32 == 24) ? n : conflict_free_stride(n + 1);
+}
+
+// K order of the perception features in the p -> h MMA: in k-steps (2q, 2q + 1), lane t computes all four filters of
+// channel 4q + t (its 3 x 3 neighbourhood is loaded once). Column k of k-step s is channel 4 (s / 2) + k % 4, filter
+// 2 (s % 2) + k / 4, i.e. feature 4 c + f of W1.
+__host__ __device__ constexpr int feature(int s, int k) { return 4 * (4 * (s / 2) + k % 4) + 2 * (s % 2) + k / 4; }
+
 template <int C, int HID>
 struct Shape {
     static constexpr int PIN = 4 * C;            // perception features
     static constexpr int KS1 = PIN / 8;          // k-steps of p -> h
     static constexpr int NT1 = HID / 8;          // n-tiles of p -> h = k-steps of h -> u
     static constexpr int NT2 = (C + 7) / 8;      // n-tiles of h -> u (channels padded to 8)
-    static_assert(PIN % 8 == 0, "4 * channels must be a multiple of 8 (even channel count)");
+    static_assert(C % 4 == 0, "channels must be a multiple of 4 (one channel per lane of a k-step pair)");
     static_assert(HID % 8 == 0, "hidden size must be a multiple of 8");
 };
 
@@ -173,14 +178,71 @@ __global__ void mask_kernel(float *__restrict__ mask, uint64_t total, uint64_t s
         mask[i] = update_mask(seed, i, update_rate);
 }
 
+// ---------------------------------------------------------------- state tile
+// CH x (TH + 2) x (TILE_W + 2) tile of an image with its 1-pixel halo. The channel planes are padded to a stride
+// that is 8 or 24 mod 32, so that lanes (g, t) reading channel 4q + t at column g hit distinct banks.
+template <int CH, int TH>
+struct Tile {
+    static constexpr int PLANE = conflict_free_stride((TH + 2) * HALO_W);
+    float v[CH][PLANE];
+    // (row, col) in halo coordinates: the tile pixel (r, c) is at (r + 1, c + 1)
+    __device__ __forceinline__ float &at(int c, int row, int col) { return v[c][row * HALO_W + col]; }
+    __device__ __forceinline__ float at(int c, int row, int col) const { return v[c][row * HALO_W + col]; }
+
+    // load the tile at (y0, x0) of an image (CH channel planes of H x W) with circular wrap
+    __device__ void load(const float *__restrict__ x, int H, int W, int y0, int x0)
+    {
+        for (int i = threadIdx.x; i < CH * (TH + 2) * HALO_W; i += THREADS) {
+            const int col = i % HALO_W, row = (i / HALO_W) % (TH + 2), c = i / (HALO_W * (TH + 2));
+            int gy = y0 - 1 + row, gx = x0 - 1 + col;
+            gy = gy < 0 ? gy + H : (gy >= H ? gy - H : gy);
+            gx = gx < 0 ? gx + W : (gx >= W ? gx - W : gx);
+            at(c, row, col) = x[((size_t)c * H + gy) * W + gx];
+        }
+    }
+
+    // the four filters [identity, sobel_x, sobel_x^T, laplacian] of channel c at tile pixel (row, col)
+    __device__ __forceinline__ void perceive(int c, int row, int col, float (&p)[4]) const
+    {
+        float v[3][3];
+#pragma unroll
+        for (int dy = 0; dy < 3; ++dy)
+#pragma unroll
+            for (int dx = 0; dx < 3; ++dx)
+                v[dy][dx] = at(c, row + dy, col + dx);
+        p[0] = v[1][1];
+        p[1] = (v[0][2] - v[0][0]) + 2.f * (v[1][2] - v[1][0]) + (v[2][2] - v[2][0]);
+        p[2] = (v[2][0] - v[0][0]) + 2.f * (v[2][1] - v[0][1]) + (v[2][2] - v[0][2]);
+        p[3] = (v[0][0] + v[0][2] + v[2][0] + v[2][2]) + 2.f * (v[0][1] + v[1][0] + v[1][2] + v[2][1]) - 12.f * v[1][1];
+    }
+
+    // The A-operand elements of the p -> h MMA (K order of feature()) for the 16 pixels (row, 0..15) of a warp:
+    // emit(s, e, v) for k-step s and fragment element e (pixel g + 8 (e % 2), column t + 4 (e / 2)).
+    template <int KS1, typename F>
+    __device__ __forceinline__ void perceive_all(int row, int g, int t, F &&emit) const
+    {
+#pragma unroll
+        for (int q = 0; q < KS1 / 2; ++q) {
+            float p0[4], p1[4];  // pixels g, g + 8
+            perceive(4 * q + t, row, g, p0);
+            perceive(4 * q + t, row, g + 8, p1);
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                emit(2 * q + h, 0, p0[2 * h]); emit(2 * q + h, 1, p1[2 * h]);
+                emit(2 * q + h, 2, p0[2 * h + 1]); emit(2 * q + h, 3, p1[2 * h + 1]);
+            }
+        }
+    }
+};
+
 // ---------------------------------------------------------------- shared-memory layout
 template <int C, int HID, bool FP32>
 struct ForwardSmem {
     using S = Shape<C, HID>;
-    FragB<FP32> w1[S::NT1][S::KS1][32];   // p -> h: b0 = W1[8j+g][8s+t], b1 = W1[8j+g][8s+t+4]
+    FragB<FP32> w1[S::NT1][S::KS1][32];   // p -> h: b0 = W1[8j+g][feature(s, t)], b1 = W1[8j+g][feature(s, t+4)]
     FragB<FP32> w2[S::NT2][S::NT1][32];   // h -> u: b0 = W2[8n+g][8j+2t], b1 = W2[8n+g][8j+2t+1] (permuted hidden)
     float b1[HID];
-    float x[C][HALO_H][HALO_W];           // state tile with circular halo
+    Tile<C, TILE_H> x;                    // state tile with circular halo
 };
 
 // Stage one NCA's weights in fragment-major order.
@@ -191,8 +253,8 @@ __device__ void stage_forward_weights(ForwardSmem<C, HID, FP32> &sm, const float
     using S = Shape<C, HID>;
     for (int i = threadIdx.x; i < S::NT1 * S::KS1 * 32; i += THREADS) {
         const int lane = i % 32, s = (i / 32) % S::KS1, j = i / (32 * S::KS1), g = lane / 4, t = lane % 4;
-        const float *row = w1 + (8 * j + g) * S::PIN + 8 * s;
-        make_frag<FP32>(sm.w1[j][s][lane], row[t], row[t + 4]);
+        const float *row = w1 + (8 * j + g) * S::PIN;
+        make_frag<FP32>(sm.w1[j][s][lane], row[feature(s, t)], row[feature(s, t + 4)]);
     }
     for (int i = threadIdx.x; i < S::NT2 * S::NT1 * 32; i += THREADS) {
         const int lane = i % 32, j = (i / 32) % S::NT1, n = i / (32 * S::NT1), g = lane / 4, t = lane % 4;
@@ -205,33 +267,21 @@ __device__ void stage_forward_weights(ForwardSmem<C, HID, FP32> &sm, const float
         sm.b1[i] = b1[i];
 }
 
-// Load a CH x (TH + 2) x (TILE_W + 2) tile of an image (CH channel planes of H x W) with circular wrap.
-template <int CH, int TH>
-__device__ void stage_tile(float (&xs)[CH][TH + 2][HALO_W], const float *__restrict__ x, int H, int W, int y0, int x0)
-{
-    for (int i = threadIdx.x; i < CH * (TH + 2) * HALO_W; i += THREADS) {
-        const int col = i % HALO_W, row = (i / HALO_W) % (TH + 2), c = i / (HALO_W * (TH + 2));
-        int gy = y0 - 1 + row, gx = x0 - 1 + col;
-        gy = gy < 0 ? gy + H : (gy >= H ? gy - H : gy);
-        gx = gx < 0 ? gx + W : (gx >= W ? gx - W : gx);
-        xs[c][row][col] = x[((size_t)c * H + gy) * W + gx];
-    }
-}
-
-// 9-tap filter f of channel c at tile pixel (row, col) (halo coordinates of the centre are row + 1, col + 1).
-template <int C, int TH>
-__device__ __forceinline__ float perceive(const float (&xs)[C][TH + 2][HALO_W], int f, int c, int row, int col)
-{
-    float v = 0.f;
-#pragma unroll
-    for (int dy = 0; dy < 3; ++dy)
-#pragma unroll
-        for (int dx = 0; dx < 3; ++dx)
-            v = fmaf(FILTERS[f][3 * dy + dx], xs[c][row + dy][col + dx], v);
-    return v;
-}
-
 // ---------------------------------------------------------------- forward
+// Growing NCA: does any cell within 2 pixels of the tile [y0, y0 + TH) x [x0, x0 + TILE_W) have alpha > 0.1 (no wrap)?
+// If not, every pixel of the tile and of its 1-pixel ring is dead before the step (pre-alive mask 0), so the tile's
+// output is 0 and no living cell depends on it: the step can skip it (alive_kernel writes its zeros). Block-uniform.
+template <int TH>
+__device__ bool near_alive(const float *__restrict__ alpha, int H, int W, int y0, int x0)
+{
+    bool any = false;
+    for (int i = threadIdx.x; i < (TH + 4) * (TILE_W + 4); i += THREADS) {
+        const int yy = y0 - 2 + i / (TILE_W + 4), xx = x0 - 2 + i % (TILE_W + 4);
+        any |= yy >= 0 && yy < H && xx >= 0 && xx < W && alpha[yy * W + xx] > 0.1f;
+    }
+    return __syncthreads_or(any);
+}
+
 template <int C, int HID, bool FP32, bool STOCH, bool ALIVE>
 __global__ void __launch_bounds__(THREADS) forward_kernel(
     const float *__restrict__ x, const float *__restrict__ w1, const float *__restrict__ b1, const float *__restrict__ w2,
@@ -247,24 +297,22 @@ __global__ void __launch_bounds__(THREADS) forward_kernel(
     const float *xn = x + (size_t)n * C * H * W;
     float *yn = y + (size_t)n * C * H * W;
 
-    stage_forward_weights<C, HID, FP32>(sm, w1 + (size_t)k * HID * S::PIN, b1 + (size_t)k * HID, w2 + (size_t)k * C * HID);
-
+    bool weights_staged = false;
     for (int tile = blockIdx.x * TILES_PER_BLOCK; tile < min(tiles, (blockIdx.x + 1) * TILES_PER_BLOCK); ++tile) {
         const int y0 = (tile / tiles_x) * TILE_H, x0 = (tile % tiles_x) * TILE_W;
+        if (ALIVE && !near_alive<TILE_H>(xn + 3 * (size_t)H * W, H, W, y0, x0))
+            continue;
+        if (!weights_staged) {  // once per block, unless all its tiles are dead
+            stage_forward_weights<C, HID, FP32>(sm, w1 + (size_t)k * HID * S::PIN, b1 + (size_t)k * HID, w2 + (size_t)k * C * HID);
+            weights_staged = true;
+        }
         __syncthreads();  // previous tile's reads (and the weight staging) are complete
-        stage_tile<C, TILE_H>(sm.x, xn, H, W, y0, x0);
+        sm.x.load(xn, H, W, y0, x0);
         __syncthreads();
 
         for (int row = warp * (TILE_H / WARPS); row < (warp + 1) * (TILE_H / WARPS); ++row) {
-            // A operand of p -> h: this lane computes filter t of channels (2s, 2s + 1) at pixels g and g + 8.
-            Op4<FP32> a[S::KS1];
-#pragma unroll
-            for (int s = 0; s < S::KS1; ++s) {
-                a[s].set(0, perceive<C, TILE_H>(sm.x, t, 2 * s, row, g));
-                a[s].set(1, perceive<C, TILE_H>(sm.x, t, 2 * s, row, g + 8));
-                a[s].set(2, perceive<C, TILE_H>(sm.x, t, 2 * s + 1, row, g));
-                a[s].set(3, perceive<C, TILE_H>(sm.x, t, 2 * s + 1, row, g + 8));
-            }
+            Op4<FP32> a[S::KS1];  // A operand of p -> h
+            sm.x.template perceive_all<S::KS1>(row, g, t, [&](int s, int e, float v) { a[s].set(e, v); });
             // h = relu(W1 p + b1): accumulator (pixel g / g + 8, hidden 8j + 2t / 2t + 1)
             float h[S::NT1][4];
 #pragma unroll
@@ -307,7 +355,7 @@ __global__ void __launch_bounds__(THREADS) forward_kernel(
                         const int ch = 8 * nt + 2 * t + e;
                         if (ch >= C)
                             continue;
-                        const float v = sm.x[ch][row + 1][px + 1] + u[nt][2 * half + e] * m;
+                        const float v = sm.x.at(ch, row + 1, px + 1) + u[nt][2 * half + e] * m;
                         yn[((size_t)ch * H + gy) * W + gx] = v;
                         if (ALIVE && ch == 3)
                             alpha[((size_t)n * H + gy) * W + gx] = v;
@@ -358,17 +406,12 @@ __global__ void alive_kernel(const float *__restrict__ x, const float *__restric
 // adjoint_kernel then forms dx = g + sum_f K_f^T * dp_f (transpose of the circular 3x3 filters).
 constexpr int BWD_TILE_H = WARPS;          // one 16-pixel row per warp
 constexpr int BWD_PIX = BWD_TILE_H * TILE_W;
+static_assert(BWD_PIX <= THREADS, "one thread per pixel checks the alive mask of a tile");
 constexpr int BWD_TILES_PER_BLOCK = NCA_BWD_TILES_PER_BLOCK;  // tiles of one image per block (amortises accumulator write-out)
 constexpr int BWD_MIN_BLOCKS = NCA_BWD_MIN_BLOCKS;            // resident blocks per SM (register bound via __launch_bounds__)
 #ifndef NCA_ABLATE
 #define NCA_ABLATE 0   // profiling only: 1 = skip weight gradients, 2 = skip dp stores, 3 = both
 #endif
-
-// smallest stride >= n with stride % 32 in {8, 24}: lanes (g, t) reading [8k + t][g] hit 32 distinct banks
-constexpr int conflict_free_stride(int n)
-{
-    return (n % 32 == 8 || n % 32 == 24) ? n : conflict_free_stride(n + 1);
-}
 
 template <int C, int HID>
 struct BwdShape {
@@ -391,7 +434,7 @@ struct BwdShape {
 template <int C, int HID, bool FP32>
 struct BackwardWeights {
     using BS = BwdShape<C, HID>;
-    FragB<FP32> w1h[BS::NT1][BS::KS1][32];   // h = W1 p: b0 = W1[8j+g][8s+t], b1 = W1[8j+g][8s+t+4]
+    FragB<FP32> w1h[BS::NT1][BS::KS1][32];   // h = W1 p: b0 = W1[8j+g][feature(s, t)], b1 = W1[8j+g][feature(s, t+4)]
     FragB<FP32> w2d[BS::NT2][BS::NT1][32];   // dh = gm W2: b0 = W2[8q+t][8j+g], b1 = W2[8q+t+4][8j+g]
     FragB<FP32> w1p[BS::NT1][BS::NTP][32];   // dp = dh W1: b0 = W1[8j+2t][8n+g], b1 = W1[8j+2t+1][8n+g]
     float b1[HID];
@@ -407,7 +450,7 @@ __global__ void pack_kernel(const float *__restrict__ w1, const float *__restric
     auto &pk = packed[k];
     for (int i = threadIdx.x; i < BS::NT1 * BS::KS1 * 32; i += blockDim.x) {
         const int lane = i % 32, s = (i / 32) % BS::KS1, j = i / (32 * BS::KS1), g = lane / 4, t = lane % 4;
-        make_frag<FP32>(pk.w1h[j][s][lane], w1[(8 * j + g) * BS::PIN + 8 * s + t], w1[(8 * j + g) * BS::PIN + 8 * s + t + 4]);
+        make_frag<FP32>(pk.w1h[j][s][lane], w1[(8 * j + g) * BS::PIN + feature(s, t)], w1[(8 * j + g) * BS::PIN + feature(s, t + 4)]);
     }
     for (int i = threadIdx.x; i < BS::NT2 * BS::NT1 * 32; i += blockDim.x) {
         const int lane = i % 32, j = (i / 32) % BS::NT1, q = i / (32 * BS::NT1), g = lane / 4, t = lane % 4;
@@ -425,7 +468,7 @@ __global__ void pack_kernel(const float *__restrict__ w1, const float *__restric
 template <int C, int HID>
 struct BackwardSmem {
     using BS = BwdShape<C, HID>;
-    float x[C][BWD_TILE_H + 2][HALO_W];
+    Tile<C, BWD_TILE_H> x;
     float p[BWD_PIX][BS::P_STRIDE];      // [p | 1 | 0]
     float h[BWD_PIX][BS::H_STRIDE];      // relu(h), later dh
     float gm[BWD_PIX][BS::G_STRIDE];     // g * m (channels zero-padded)
@@ -460,21 +503,28 @@ __global__ void __launch_bounds__(THREADS, BWD_MIN_BLOCKS) backward_kernel(
     const int row = warp;
     for (int tile = blockIdx.x * BWD_TILES_PER_BLOCK; tile < min(tiles, (blockIdx.x + 1) * BWD_TILES_PER_BLOCK); ++tile) {
         const int y0 = (tile / tiles_x) * BWD_TILE_H, x0 = (tile % tiles_x) * TILE_W, Y = y0 + row;
+        if constexpr (ALIVE) {  // all cells of the tile dead after the step: no gradient through them, dp = 0
+            const int X = x0 + threadIdx.x % TILE_W, Yt = y0 + threadIdx.x / TILE_W;
+            const bool any = threadIdx.x < BWD_PIX && Yt < H && X < W && alive[((size_t)n * H + Yt) * W + X];
+            if (!__syncthreads_or(any)) {
+                for (int i = threadIdx.x; i < BS::PIN * BWD_PIX; i += THREADS) {
+                    const int px = i % BWD_PIX, f = i / BWD_PIX, YY = y0 + px / TILE_W, XX = x0 + px % TILE_W;
+                    if (YY < H && XX < W)
+                        dpn[f * plane + (size_t)YY * W + XX] = 0.f;
+                }
+                continue;
+            }
+        }
         __syncthreads();  // previous tile's shared reads are complete
-        stage_tile<C, BWD_TILE_H>(sm.x, xn, H, W, y0, x0);
+        sm.x.load(xn, H, W, y0, x0);
         __syncthreads();
 
-        // ---- p (A fragments + shared copy with the ones column), h = W1 p + b1
+        // ---- p (A fragments + shared copy in K order with the ones column), h = W1 p + b1
         Op4<FP32> a[BS::KS1];
-#pragma unroll
-        for (int s = 0; s < BS::KS1; ++s) {
-            const float v0 = perceive<C, BWD_TILE_H>(sm.x, t, 2 * s, row, g), v1 = perceive<C, BWD_TILE_H>(sm.x, t, 2 * s, row, g + 8);
-            const float v2 = perceive<C, BWD_TILE_H>(sm.x, t, 2 * s + 1, row, g), v3 = perceive<C, BWD_TILE_H>(sm.x, t, 2 * s + 1, row, g + 8);
-            a[s].set(0, v0); a[s].set(1, v1); a[s].set(2, v2); a[s].set(3, v3);
-            float *p0 = sm.p[16 * row + g], *p1 = sm.p[16 * row + g + 8];
-            p0[8 * s + t] = staged<FP32>(v0); p1[8 * s + t] = staged<FP32>(v1);
-            p0[8 * s + t + 4] = staged<FP32>(v2); p1[8 * s + t + 4] = staged<FP32>(v3);
-        }
+        sm.x.template perceive_all<BS::KS1>(row, g, t, [&](int s, int e, float v) {
+            a[s].set(e, v);
+            sm.p[16 * row + g + 8 * (e % 2)][8 * s + t + 4 * (e / 2)] = staged<FP32>(v);
+        });
         for (int i = lane; i < 16 * (BS::P_STRIDE - BS::PIN); i += 32)
             sm.p[16 * row + i % 16][BS::PIN + i / 16] = (i / 16 == 0) ? 1.f : 0.f;
         uint32_t positive[(BS::NT1 * 4 + 31) / 32] = {};
@@ -608,9 +658,9 @@ __global__ void __launch_bounds__(THREADS, BWD_MIN_BLOCKS) backward_kernel(
             const int hid = 8 * (warp * BS::NIW + q) + 2 * t + e % 2;
 #pragma unroll
             for (int mi = 0; mi < BS::MTA; ++mi) {
-                const int f = 16 * mi + g + 8 * (e / 2);
+                const int f = 16 * mi + g + 8 * (e / 2);  // K position of the feature (PIN: the ones column)
                 if (f <= BS::PIN)
-                    out[hid * (BS::PIN + 1) + f] = accp[mi][q][e];
+                    out[hid * (BS::PIN + 1) + (f < BS::PIN ? feature(f / 8, f % 8) : f)] = accp[mi][q][e];
             }
 #pragma unroll
             for (int mi = 0; mi < BS::MT2; ++mi) {

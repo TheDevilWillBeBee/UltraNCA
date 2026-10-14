@@ -188,6 +188,7 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = cfg['train']['tf32']
 
     files = sorted(glob.glob(os.path.join(path(cfg['targets']), '*.png')) + glob.glob(os.path.join(path(cfg['targets']), '*.jpg')))
+    files = files[:cfg.get('num_targets')]  # null: all
     names = [os.path.basename(f) for f in files]
     todo = [i for i, n in enumerate(names) if not os.path.exists(os.path.join(out, os.path.splitext(n)[0] + '.pt'))]  # resumable
     log_path = os.path.join(out, 'log.json')
