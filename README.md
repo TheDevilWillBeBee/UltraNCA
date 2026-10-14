@@ -1,6 +1,6 @@
-# UltraNCA: batched texture-NCA training
+# UltraNCA: batched NCA training
 
-Trains one texture NCA per target image. K NCAs (one per target) train together in a single forward and backward pass, and each keeps exactly the semantics of an independent run:
+Trains one NCA per target image: texture NCAs (`config.yml`) or growing NCAs (`config_growing.yml`, Distill "Growing Neural Cellular Automata": alive mask on alpha = channel 3, L2 loss to the premultiplied RGBA target, single living cell as the seed). K NCAs (one per target) train together in a single forward and backward pass, and each keeps exactly the semantics of an independent run:
 - its own target, pool, batch, OT loss and per-tensor gradient normalisation;
 - Adam (elementwise, so stacking the K weight sets changes nothing) with step learning-rate decay.
 
@@ -13,6 +13,8 @@ The NCA is the standard texture NCA:
 - stochastic update with p = 0.5;
 - RGB = state[:3] + 0.5.
 
+The growing NCA has 16 channels and 128 hidden units; the stochastic update can be switched off (`update_rate: 1`).
+
 Weights are saved in the vanilla format: `w1.weight` (96, 48, 1, 1), `w1.bias` (96,), `w2.weight` (12, 96, 1, 1).
 
 ## Quick start
@@ -20,29 +22,33 @@ Weights are saved in the vanilla format: `w1.weight` (96, 48, 1, 1), `w1.bias` (
 ```bash
 pip install -r requirements.txt
 python prepare/download_pbr.py      # 72 PBR albedo textures -> data/pbr_textures/*.jpg
+python prepare/download_emoji.py    # 64 Noto emojis -> data/emoji/*.png (growing NCAs)
 bash ncaops/build.sh                # CUDA extension (nanobind + CMake, sm_80+); needed for impl: cuda
 python ncaops/testing/test_nca.py   # CUDA kernels vs a PyTorch reference (add --bench for timings)
 python train.py                     # config.yml -> runs/pbr/<texture>.pt, <texture>.png (target | NCA), log.json
-python benchmark.py --impl eager triton cuda --K 1 24
+python train.py config_growing.yml  # growing NCAs -> runs/emoji
+python benchmark.py train infer --K 32
 ```
 
 ## Files
 
 | file | content |
 |---|---|
-| `config.yml` | data, init (`null` = random), NCA size, schedule, group size K, `impl` |
+| `config.yml` | texture task: data, init (`null` = random), NCA size, schedule, group size K, `impl`, loss options |
+| `config_growing.yml` | growing task (same schedule, 16 / 128 NCA) |
 | `train.py` | batched training loop, eager step, saving / previews / log (resumable: finished targets are skipped) |
-| `loss.py` | OT texture loss on VGG16 features: relaxed EMD (cosine) + mean / covariance matching over relu1_1 … relu5_1, 1024 random positions per layer; target features computed once per group |
+| `loss.py` | OT texture loss on VGG16 features: relaxed EMD (cosine) + mean / covariance matching over relu1_1 … relu5_1, 1024 random positions per layer; target features computed once per group (`cache_targets`: also the target terms of the unsampled layers), optional bf16 VGG (`vgg_bf16`) |
 | `nca_triton.py` | fused Triton step (`impl: triton`) |
 | `ncaops/` | fused CUDA step (`impl: cuda`) |
-| `ncaops/nca_step.cuh` | CUDA kernels, with tuning knobs at the top |
+| `ncaops/nca_step.cuh` | CUDA kernels, with the per-GPU configuration and tuning knobs at the top |
 | `ncaops/nca_cuda.cu` | nanobind bindings |
 | `ncaops/nca_ops.py` | autograd wrapper |
 | `ncaops/build.sh`, `ncaops/CMakeLists.txt` | build |
 | `ncaops/testing/test_nca.py` | correctness tests and benchmark |
 | `ncaops/testing/profile_one_step.py` | one step, for profilers |
-| `benchmark.py` | steady-state cost per training iteration vs K and `impl` |
+| `benchmark.py` | steady-state cost per training iteration (`train`) and of no-grad rollouts (`infer`) vs K and `impl` |
 | `prepare/download_pbr.py` | PBR dataset download (same source as Cells2Pixels), albedo maps only |
+| `prepare/download_emoji.py` | 64 Noto emojis (v2.047) for the growing task |
 
 Default schedule (`config.yml`):
 - batch 2 per NCA, pool 64, 768 iterations;
@@ -53,7 +59,7 @@ Default schedule (`config.yml`):
 
 This is the batch-2 point of a batch-size study at a fixed sample budget. It came within about 3 % of the original 1500-iteration batch-4 schedule when started from a good (decoder-predicted) initialisation. From a **random** init (the default here), a longer schedule may be needed for full quality. That does not matter for speed work.
 
-## What was done (measured on one A100 80 GB)
+## What was done (sections 1–3 and the A100 check: one A100 80 GB; section 5: RTX 4090)
 
 ### 1. Batching NCAs on different targets
 
@@ -76,7 +82,7 @@ Measurements are on 24 DyNCA PBR textures, K = 24, batch 2, 768 iterations, star
 | `compile` (`torch.compile` step and loss) | 11.4 | 1.33× | 6.1× | 338 ms | 57 GB | 1.002 |
 | `triton` | 5.6 | 2.7× | 12.5× | 153 ms | 8.6 GB | 1.005 |
 | `cuda` (version of 13:30) | 3.9 | 3.9× | 17.9× | 99.5 ms | ~7 GB | 1.002 |
-| `cuda` (current; measured on the 72 Cells2Pixels textures in the [standalone check](#standalone-check-current-code-this-folder)) | 3.4–3.5 | about 4.3× | about 20× | **86.1 ms** | 5.6 GB | – |
+| `cuda` (current; measured on the 72 Cells2Pixels textures in the [A100 check](#a100-check-kernels-of-that-time)) | 3.4–3.5 | about 4.3× | about 20× | **86.1 ms** | 5.6 GB | – |
 
 - **Quality is the same for every implementation.** An apparent 0.7 % Triton gap disappeared on re-runs. Exact-fp32 Triton was equal too, so TF32 is not a quality issue.
 - **Group size.** Speed saturates around K ≈ 24–32: Triton gives 30.2 / 8.2 / 6.1 / 5.7 / 5.5 / 5.4 s per NCA at K = 1 / 4 / 12 / 24 / 32 / ≥48. Pick a K that divides the number of targets evenly; a smaller last group is slower per NCA.
@@ -92,49 +98,35 @@ Measurements are on 24 DyNCA PBR textures, K = 24, batch 2, 768 iterations, star
 Design decisions (agreed with the user):
 - TF32 tensor cores, with an FP32 mode via 3xTF32 (hi/lo operand split, three MMAs; matches fp32 to about 1e-6);
 - deterministic weight-gradient reductions (bitwise reproducible);
-- in-kernel Philox update mask;
-- templates on channels and hidden size (12/96 instantiated; add a line in `dispatch()` for others);
+- in-kernel Philox update mask (one Philox call per 4 pixels; `nca_ops.update_mask` gives the same mask);
+- templates on channels, hidden size, FP32 mode, stochastic update and alive mask (12/96 and 16/128 instantiated; add a line in `dispatch()` for others);
 - fixed 4 filters, circular padding, any H × W.
 
-All matmuls use `mma.sync.m16n8k8` TF32. One warp handles 16 pixels of an image row, which is the MMA M dimension.
+All matmuls use `mma.sync.m16n8k8` TF32; a warp computes 16 pixels at a time (the MMA M dimension). Only the **updating pixels** (m = 1 and, for a growing NCA, alive) go through the MLP, in the forward and the backward: about half the matmul work at update rate 0.5.
 
-| kernel | what it does | time per step (K = 24, B = 2, 128², TF32) |
+| kernel | what it does |
+|---|---|
+| `forward_kernel` | A block sweeps a 16-pixel-wide column strip (a segment of rows) of an image: state rows go into a ring in shared memory (loads of the next phase issued before the current matmuls), the pixels that do not update copy x, and the updating ones are queued; every 128 queued pixels each of the 8 warps runs perception → h → relu → u on 16 of them. Weights are staged once per block in fragment-major order; h stays in registers between the two matmuls (permuted hidden index). Growing NCAs: rows and segments without a living cell within 2 pixels are skipped. |
+| `alive_kernel` | growing NCAs: alive mask from the old and new alpha (3×3 max-pools), y ×= mask, mask stored for the backward |
+| `pack_kernel` | per-NCA weights → B fragments for the backward matmuls |
+| `backward_kernel` | Per tile (6 rows × 16 when stochastic, else 4 × 16), the updating pixels in rounds of 4 groups of 16: recompute p and h; stage p, relu(h) and g·m in shared memory; dW2 += (g·m)ᵀ relu(h); then per hidden n-tile dh = (g·m)W2·[h>0] → db1 (shuffles), dp += dh W1 (→ global), dh staged; dW1 += pᵀ dh. Weight-gradient MMAs cover only the occupied pixel slots. 16/128 on 100 KB GPUs stages relu(h) / dh in two halves (2 blocks per SM). Writes an updating-pixel map instead of zeros in dp. |
+| `reduce_kernel` | sums the per-block partial weight gradients per NCA in a fixed order |
+| `adjoint_kernel` | dx = g(·a) + Σ_f K_fᵀ ⋆ dp_f (transpose of the circular 3×3 filters) over the updating pixels' dp; 4 pixels per thread |
+
+The backward and adjoint run in chunks of images on two streams so that dp stays in L2. Inference (`nca_ops.rollout`) loops over steps in C++.
+
+**Per-GPU configuration.** The top of `nca_step.cuh` has one hardware constant, `NCA_SMEM_PER_SM_KB` (shared memory per SM: A100 164, RTX 30xx / 40xx 100, H100 228), which `build.sh` sets from the compute capability of the machine's GPU. Blocks per SM (forward) and the backward staging layout (one or two parts) derive from it; the L2 size (backward chunks), SM count and occupancy (forward segment length) are queried at run time. The remaining knobs (`NCA_FWD_WARPS`, `NCA_FWD_RING`, `NCA_BWD_TILES_PER_BLOCK`, `NCA_BWD_UNROLL`, `NCA_BWD_MIN_BLOCKS`) are tuning choices measured on sm_89; on another GPU, rebuild and optionally sweep them, e.g. `bash ncaops/build.sh "-DNCA_FWD_RING=20 -DNCA_BWD_TILES_PER_BLOCK=4"`.
+
+Correctness (`ncaops/testing/test_nca.py`, against PyTorch autograd with the same mask, for both sizes, update rate 0.5 / 1, texture / growing, partial tiles; also determinism, chunked backward and rollout = repeated steps):
+
+| mode | forward | gradients |
 |---|---|---|
-| `forward_kernel` | stages the state tile + circular halo in shared memory, and the weights once per block in fragment-major order (each lane reads its pre-converted B fragment: no bank conflicts, no conversions in the inner loops); perception → h → relu → u → y = x + u·m. The hidden activations stay in registers between the two matmuls: the accumulator columns (2t, 2t+1) are reused as A-operand columns (t, t+4) by permuting W2's hidden index. | 0.25 ms |
-| `pack_kernel` | per-NCA weights → B fragments for the backward matmuls | 0.01 ms |
-| `backward_kernel` | recomputes p and h, then dh = (g·m)W2·[h>0] and dp = dh·W1 (MMA, registers; dp → global). Weight gradients as [p \| 1]ᵀ·dh and (g·m)ᵀ·relu(h) over each 64-pixel block tile. The ones column gives db1; each warp owns 3 hidden n-tiles, so fragments are reused across output tiles. Shared-memory operands are stored already rounded to TF32. | 0.80 ms |
-| `reduce_kernel` | sums the per-block partial weight gradients per NCA in a fixed order | 0.03 ms |
-| `adjoint_kernel` | dx = g + Σ_f K_fᵀ ⋆ dp_f (transpose of the circular 3×3 filters); one thread per (pixel, channel), taps through L1 | 0.24 ms |
-
-Correctness (`ncaops/testing/test_nca.py`, against PyTorch autograd with the same mask, including partial tiles):
-
-| mode | forward | dx | dW1 / db1 / dW2 |
-|---|---|---|---|
-| FP32 | 9e-7 | 7e-7 | 2–7e-6 |
-| TF32 | 3e-4 | 1e-2 | 1e-2 / 1e-2 / 4e-4 |
+| FP32 | 9e-7 | 2–5e-6 |
+| TF32 | 4e-4 | 1–2e-2 |
 
 The TF32 errors are the same as eager PyTorch TF32 vs FP32 on the same step; they come from TF32 itself.
 
-What moved the needle on the backward:
-
-| change | backward kernel | 64-step rollout |
-|---|---|---|
-| first version | 1.83 ms | 171 ms |
-| operands stored in shared memory pre-rounded to TF32 (the inner loops were bound by `cvt.rna.tf32`) | 1.38 ms | 135 ms |
-| weight gradients reformulated with warp-owned hidden tiles (about 3× fewer shared-memory loads per MMA) | 0.83 ms | 99.5 ms |
-| adjoint: shared-memory staging → direct L1 version (0.41 → 0.24 ms) | | 88 ms |
-| tile tuning (`TILE_H` 16, 2 tiles per forward block, 8 per backward block) | 0.80 ms | 86 ms |
-
-What did **not** help:
-- k-outer loop reordering or split accumulators (more registers → spills);
-- holding filter taps in registers;
-- `NCA_BWD_MIN_BLOCKS` = 3 (spills; 1.14 ms).
-
-Tuning knobs at the top of `nca_step.cuh` can be overridden at build time, e.g. `bash ncaops/build.sh "-DNCA_TILE_H=8 -DNCA_TILES_PER_BLOCK=8"`.
-
-**Profiling note.** Nsight Compute had no performance-counter permission on the development pod (`ERR_NVGPUCTRPERM`). Kernels were analysed by ablation (the `NCA_ABLATE` macro skips the weight gradients and/or the dp stores) and with `torch.profiler`. Ablation of the current backward kernel: about 0.2 ms of its 0.80 ms are the dp stores.
-
-### Standalone check (current code, this folder)
+### A100 check (kernels of that time)
 
 Run on 2026-10-14, A100 80 GB, with `prepare/download_pbr.py`, `ncaops/build.sh` and the default `config.yml` (72 PBR albedos, random init, `impl: cuda`, K = 24, 3 groups):
 - training: 3.4–3.5 s per NCA (compilation excluded);
@@ -149,27 +141,37 @@ Run on 2026-10-14, A100 80 GB, with `prepare/download_pbr.py`, `ncaops/build.sh`
 | triton | 33.0 | 5.7 | 178 | 5.9 GB |
 | **cuda** | **17.2** | **3.6** | **111** | **5.6 GB** |
 
+### 5. RTX 4090 results (2026-10-14)
+
+Per step, K = 32, B = 2, 128², update rate 0.5 (µs; "before" = the CUDA kernels before the updating-pixel work, commit `ebbfd18`):
+
+| | forward before | forward now | backward before | backward now |
+|---|---|---|---|---|
+| texture 12/96 | 259 | 153 | 1054 | ~925 |
+| 16/128 (no alive mask) | 591 | 290 | 1880 | ~1550 |
+| growing 16/128 | 384 | 296 | 1212 | ~1125 |
+
+Training, 32 targets, 768 iterations, `config.yml` / `config_growing.yml` schedule, K = 32 (s per NCA, compilation excluded): texture 3.05 → 2.6, growing 2.8 → 2.5. `benchmark.py train`: 111 ms per texture iteration (OT loss about 40 ms of it), 80 ms per growing iteration.
+
+OT loss (compiled, forward + backward, 64 images of 128²): 47.0 → 39.9 ms with TF32 VGG, 26.1 ms with `vgg_bf16: true`. The relaxed-EMD backward now goes through the minimising pairs only (no dense 1024² gradient), VGG runs in channels_last, and `cache_targets` computes the target terms of the unsampled layers once (turn it off when the targets change at every call). bf16 VGG was checked on 32 textures × 2 seeds: training 11 % faster, OT loss evaluated in fp32 within seed noise (+1–2 % on average), previews indistinguishable; it stays opt-in.
+
+Inference, 256 steps without gradients (ms):
+
+| workload | texture before | texture now | growing before | growing now |
+|---|---|---|---|---|
+| K = 32, 64² | 9.0 | 6.7 | 14.0 | 10.6 |
+| K = 32, 128² | 29.9 | 17.7 | 26.2 | 21.6 |
+| 1 NCA, 128² | 3.05 | 2.1 | 4.9 | 3.4 |
+| 1 NCA, 512² | 14.9 | 10.5 | 9.8 | 8.2 |
+| 1 NCA, 1024² | 59.5 | 37.1 | 29.5 | 28.8 |
+| 1 NCA, 2048² | 231 | 143 | 116 | 107 |
+
+Growing at 2048² is dominated by `alive_kernel` writing zeros to the dead cells (about 350 µs of 420 µs per step, near DRAM bandwidth).
+
 ## Planned next steps (in rough order of expected gain)
 
-1. **Fuse the adjoint into the backward kernel**, removing the dp round trip through global memory: about 0.2 ms of stores plus the 0.24 ms adjoint kernel, roughly 30 % of the backward.
-   - Recompute a 1-pixel halo: output tiles 14 columns wide, so a 16-pixel MMA row covers the halo on both sides, plus TH + 2 rows.
-   - Stage dp for the tile and halo in shared memory, then apply the transposed stencil for the interior.
-   - Weight gradients must count interior pixels only: zero g·m and dh for halo pixels in the weight-gradient staging, but not in the dp computation.
-   - The recompute overhead is about (TH+2)/TH × 16/14: 1.43× at TH = 8.
-2. **Backward register pressure.** It uses 255 registers with small spills at 2 blocks per SM (8 warps per SM, low occupancy). Options:
-   - split dp and weight gradients into two kernels;
-   - use 8 warps per block with half the per-warp accumulators;
-   - move the weight-gradient accumulators to shared memory.
-3. **Forward** is about 4× above a rough bound of 0.07 ms per step (MMA count, shared-memory loads, and about 90 MB of traffic). Ideas:
-   - `cp.async` double-buffering of the next state tile;
-   - computing the 4 filters per (pixel, channel) once instead of one filter per lane;
-   - 8 warps.
-4. **OT loss** (about 20 % of an iteration with the CUDA step):
-   - `argsort` of a random vector over 16k positions per image and layer for the subsampling (use cheaper sampling);
-   - VGG in bf16 or channels-last;
-   - fusing the cosine-distance min-reductions.
-5. **Philox mask:** currently 4 lanes compute the same pixel's mask (redundant). Compute it once per pixel and shuffle, or once per 4 pixels from the 4 Philox output words.
-6. **Multi-step fusion** (several NCA steps per launch with halo growth) for the no-grad parts of a rollout, if truncated backpropagation is ever used.
-7. **Larger targets / other GPUs:**
-   - H100 `wgmma`;
-   - other (C, HID) instantiations (`dispatch()` in `nca_cuda.cu`; HID must be a multiple of 32 (8 per n-tile × 4 warps) and C even).
+1. **Fuse the adjoint into the backward kernel** (no dp round trip). Staging a tile's dp needs about 20 KB more shared memory per block: it fits on the A100 / H100, but on 100 KB GPUs it would cost the second block per SM.
+2. **Backward register pressure**: 255 registers with small spills (16/128), 8 warps per SM. The 16/128 backward at update rate 1 is currently about 10 % slower than before the updating-pixel rework (instruction scheduling).
+3. **OT loss**: VGG is now about 33 of its 40 ms; bf16 VGG (validated, opt-in) halves it.
+4. **Sparse growing grids**: skip the zero writes of dead cells (e.g. track the live bounding box) for very large, mostly empty grids.
+5. **Other GPUs**: H100 `wgmma`; other (C, HID) instantiations (`dispatch()` in `nca_cuda.cu`; C a multiple of 4, HID a multiple of 32).
