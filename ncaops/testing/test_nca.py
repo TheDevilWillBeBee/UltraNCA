@@ -53,7 +53,7 @@ def mask_for(K, B, H, W, seed, rate):
 
 def test():
     """Per case and precision: the largest relative error of the forward over several shapes (including partial
-    tiles), of the gradients (dx, dw1, db1, dw2) over two shapes, and whether two TF32 backward runs are bitwise equal."""
+    tiles), of the gradients (dx, dw1, db1, dw2) over two shapes, and whether TF32 backward runs (also in several image chunks) are bitwise equal."""
     torch.backends.cuda.matmul.allow_tf32 = False; torch.backends.cudnn.allow_tf32 = False
     ok = True
     for C, HID in ((12, 96), (16, 128)):
@@ -74,6 +74,9 @@ def test():
                     for fp32 in (True, False):
                         out = grads(lambda *p: nca_ops.step(*p, rate, growing, fp32=fp32, seed=99))
                         bwd[fp32] = max([bwd[fp32]] + [rel(a, b) for a, b in zip(out, ref)])
+                    nca_ops.CHUNK = 4  # the backward in several launches
+                    det &= all(torch.equal(a, b) for a, b in zip(out, grads(lambda *p: nca_ops.step(*p, rate, growing, seed=99))))
+                    nca_ops.CHUNK = None
                     det &= all(torch.equal(a, b) for a, b in zip(out, grads(lambda *p: nca_ops.step(*p, rate, growing, seed=99))))
                 passed = det and all(fwd[p] < BOUNDS[p][0] and bwd[p] < BOUNDS[p][1] for p in (True, False))
                 ok &= passed

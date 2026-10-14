@@ -4,9 +4,10 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
-#include <utility>
+#include <tuple>
+#include <algorithm>
 #include <type_traits>
-#include <nanobind/stl/pair.h>
+#include <nanobind/stl/tuple.h>
 #include "nca_step.cuh"
 
 namespace nb = nanobind;
@@ -126,13 +127,22 @@ static int backward_blocks_per_image(int H, int W)
     return ceil_div(tiles, nca_step::BWD_TILES_PER_BLOCK);
 }
 
-// Workspace sizes for backward(): (packed weight bytes per NCA, partial floats per image).
-std::pair<size_t, size_t> backward_workspace(size_t C, size_t HID, bool fp32, size_t H, size_t W)
+// Images per backward chunk: the backward and adjoint kernels run on chunks of images whose dp (4C planes per image)
+// fits in half of the L2 cache, so that the adjoint reads dp from L2 rather than DRAM.
+static size_t chunk_images(size_t N, size_t C, size_t H, size_t W)
+{
+    static int l2 = [] { int dev, v; cudaGetDevice(&dev); cudaDeviceGetAttribute(&v, cudaDevAttrL2CacheSize, dev); return v; }();
+    return std::clamp<size_t>(l2 / 2 / (4 * C * H * W * sizeof(float)), 1, N);
+}
+
+// Workspace sizes for backward(): (packed weight bytes per NCA, partial floats per image, images of dp per launch).
+std::tuple<size_t, size_t, size_t> backward_workspace(size_t C, size_t HID, bool fp32, size_t N, size_t H, size_t W)
 {
     return dispatch(C, HID, fp32, false, false, [&](auto I) {
         using D = decltype(I);
-        return std::make_pair(sizeof(nca_step::BackwardWeights<D::C, D::HID, D::FP32>),
-                              (size_t)backward_blocks_per_image(H, W) * nca_step::BwdShape<D::C, D::HID>::PARTIAL);
+        return std::make_tuple(sizeof(nca_step::BackwardWeights<D::C, D::HID, D::FP32>),
+                               (size_t)backward_blocks_per_image(H, W) * nca_step::BwdShape<D::C, D::HID>::PARTIAL,
+                               chunk_images(N, C, H, W));
     });
 }
 
@@ -152,8 +162,10 @@ void backward(FloatArray4D x, FloatArray4D gy, ByteArray3D alive, FloatArray3D w
     validate_array_shape(db1, {K, HID}, "db1");
     validate_array_shape(w2, {K, C, HID}, "w2");
     validate_array_shape(dw2, {K, C, HID}, "dw2");
-    validate_array_shape(dp, {N, 4 * C, H, W}, "dp");
-    const auto [packed_bytes, partial_floats] = backward_workspace(C, HID, fp32, H, W);
+    const auto workspace = backward_workspace(C, HID, fp32, N, H, W);
+    const size_t packed_bytes = std::get<0>(workspace), partial_floats = std::get<1>(workspace);
+    const size_t chunk = dp.shape(0);  // images per launch (any number >= 1)
+    validate_array_shape(dp, {std::max<size_t>(chunk, 1), 4 * C, H, W}, "dp");
     validate_array_shape(packed, {K * packed_bytes}, "packed");
     validate_array_shape(partial, {N * partial_floats}, "partial");
     if (growing)
@@ -170,17 +182,21 @@ void backward(FloatArray4D x, FloatArray4D gy, ByteArray3D alive, FloatArray3D w
         constexpr int smem = sizeof(nca_step::BackwardSmem<D::C, D::HID>);
         set_smem(kernel, smem);
         const int blocks = backward_blocks_per_image(H, W);
-        kernel<<<dim3(blocks, N), nca_step::BWD_THREADS, smem>>>(x.data(), gy.data(), alive.data(), pk, dp.data(),
-                                                            partial.data(), batch_per_nca, H, W, seed, update_rate);
-        cuda_check(cudaGetLastError());
-
+        const size_t plane = H * W;
+        for (size_t n0 = 0; n0 < N; n0 += chunk)
+        {
+            const size_t n = std::min(chunk, N - n0);
+            kernel<<<dim3(blocks, n), nca_step::BWD_THREADS, smem>>>(x.data(), gy.data(), alive.data(), pk, dp.data(),
+                                                                    partial.data(), n0, batch_per_nca, H, W, seed, update_rate);
+            cuda_check(cudaGetLastError());
+            const uint64_t total = (uint64_t)n * D::C * plane;
+            nca_step::adjoint_kernel<D::C, D::ALIVE><<<(unsigned)((total + 255) / 256), 256>>>(
+                dp.data(), gy.data() + n0 * D::C * plane, alive.data() + (growing ? n0 * plane : 0),
+                gx.data() + n0 * D::C * plane, H, W, total);
+            cuda_check(cudaGetLastError());
+        }
         nca_step::reduce_kernel<D::C, D::HID><<<dim3(ceil_div(BS::PARTIAL, 256), K), 256>>>(
             partial.data(), batch_per_nca * blocks, dw1.data(), db1.data(), dw2.data());
-        cuda_check(cudaGetLastError());
-
-        const uint64_t total = (uint64_t)N * D::C * H * W;
-        nca_step::adjoint_kernel<D::C, D::ALIVE><<<(unsigned)((total + 255) / 256), 256>>>(dp.data(), gy.data(), alive.data(),
-                                                                                           gx.data(), H, W, total);
         cuda_check(cudaGetLastError());
     });
 }
@@ -201,12 +217,12 @@ NB_MODULE(nca_cuda, m)
           "w2: (K, C, hidden). fp32=False uses TF32 tensor cores, fp32=True 3xTF32 (fp32 accuracy). update_rate >= 1: "
           "every cell updates. growing: alive masking (alpha = channel 3); alpha (N, H, W) is a workspace and alive "
           "(N, H, W) receives the mask for backward() (both unused otherwise).");
-    m.def("backward_workspace", &backward_workspace, "channels"_a, "hidden"_a, "fp32"_a, "H"_a, "W"_a,
-          "(packed weight bytes per NCA, partial floats per image) for backward().");
+    m.def("backward_workspace", &backward_workspace, "channels"_a, "hidden"_a, "fp32"_a, "N"_a, "H"_a, "W"_a,
+          "(packed weight bytes per NCA, partial floats per image, images of dp) for backward().");
     m.def("backward", &backward, "x"_a, "gy"_a, "alive"_a, "w1"_a, "b1"_a, "w2"_a, "gx"_a, "dw1"_a, "db1"_a, "dw2"_a,
           "packed"_a, "dp"_a, "partial"_a, "batch_per_nca"_a, "seed"_a, "update_rate"_a, "fp32"_a, "growing"_a,
-          "Gradients of one NCA step (same seed, update_rate and, if growing, alive mask as the forward). Writes gx, dw1, db1, dw2; packed, dp (N, 4C, H, W) "
-          "and partial are workspaces sized by backward_workspace(). Weight gradients are reduced in a fixed order.");
+          "Gradients of one NCA step (same seed, update_rate and, if growing, alive mask as the forward). Writes gx, dw1, db1, dw2; packed, dp and partial "
+          "are workspaces sized by backward_workspace(): dp (chunk, 4C, H, W) holds the images of one launch. Weight gradients are reduced in a fixed order.");
     m.def("update_mask", &update_mask, "mask"_a, "seed"_a, "update_rate"_a,
           "The stochastic update mask used by forward / backward: mask (N, H, W) = floor(U + update_rate).");
 }

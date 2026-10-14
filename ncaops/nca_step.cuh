@@ -527,18 +527,18 @@ template <int C, int HID, bool FP32, bool STOCH, bool ALIVE>
 __global__ void __launch_bounds__(BWD_THREADS, BWD_MIN_BLOCKS) backward_kernel(
     const float *__restrict__ x, const float *__restrict__ gy, const uint8_t *__restrict__ alive,
     const BackwardWeights<C, HID, FP32> *__restrict__ packed, float *__restrict__ dp, float *__restrict__ partial,
-    int B, int H, int W, uint64_t seed, float update_rate)
+    int n0, int B, int H, int W, uint64_t seed, float update_rate)
 {
     using BS = BwdShape<C, HID>;
     extern __shared__ __align__(16) unsigned char smem_raw[];
     auto &sm = *reinterpret_cast<BackwardSmem<C, HID> *>(smem_raw);
 
-    const int n = blockIdx.y, k = n / B;
+    const int n = n0 + blockIdx.y, k = n / B;  // image; dp holds the images n0, n0 + 1, ... of this launch
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, g = lane / 4, t = lane % 4;
     const int tiles_x = (W + TILE_W - 1) / TILE_W, tiles = tiles_x * ((H + BWD_TILE_H - 1) / BWD_TILE_H);
     const size_t plane = (size_t)H * W;
     const float *xn = x + n * C * plane, *gyn = gy + n * C * plane;
-    float *dpn = dp + n * BS::PIN * plane;
+    float *dpn = dp + blockIdx.y * BS::PIN * plane;
     const auto &wk = packed[k];
 
     float accp[BS::MTA][BS::NIW][4] = {};   // p^T dh        -> dW1^T, hidden n-tiles of this warp
