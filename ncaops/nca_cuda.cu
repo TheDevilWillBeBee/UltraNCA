@@ -180,9 +180,9 @@ void rollout(FloatArray4D x, FloatArray3D w1, FloatArray2D b1, FloatArray3D w2, 
     }
 }
 
-static int backward_blocks_per_image(int H, int W, bool stoch)
+static int backward_blocks_per_image(int H, int W, bool stoch, bool alive)
 {
-    const int tiles = ceil_div(W, nca_step::TILE_W) * ceil_div(H, nca_step::bwd_tile_h(stoch));
+    const int tiles = ceil_div(W, nca_step::TILE_W) * ceil_div(H, nca_step::bwd_tile_h(stoch, alive));
     return ceil_div(tiles, nca_step::BWD_TILES_PER_BLOCK);
 }
 
@@ -225,14 +225,14 @@ static void join(cudaStream_t waiter, cudaStream_t stream)
 std::tuple<size_t, size_t, size_t> backward_workspace(size_t C, size_t HID, bool fp32, size_t N, size_t H, size_t W,
                                                       float update_rate, bool growing)
 {
-    return dispatch(C, HID, fp32, update_rate < 1.f, false, [&](auto I) {
+    return dispatch(C, HID, fp32, update_rate < 1.f, growing, [&](auto I) {
         using D = decltype(I);
         auto kernel = nca_step::backward_kernel<D::C, D::HID, D::FP32, D::STOCH, D::ALIVE>;
-        constexpr int smem = sizeof(nca_step::BackwardSmem<D::C, D::HID, nca_step::bwd_tile_h(D::STOCH)>);
+        constexpr int smem = sizeof(nca_step::BackwardSmem<D::C, D::HID, nca_step::BWD_TILE_H_MAX>);
         set_smem(kernel, smem);
         int blocks_per_sm;
         cuda_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, kernel, nca_step::BWD_THREADS, smem));
-        const int blocks = backward_blocks_per_image(H, W, D::STOCH);
+        const int blocks = backward_blocks_per_image(H, W, D::STOCH, D::ALIVE);
         return std::make_tuple(sizeof(nca_step::BackwardWeights<D::C, D::HID, D::FP32>),
                                (size_t)blocks * nca_step::BwdShape<D::C, D::HID>::PARTIAL,
                                chunk_images(N, C, H, W, blocks, blocks_per_sm, growing));
@@ -277,9 +277,9 @@ void backward(FloatArray4D x, FloatArray4D gy, ByteArray3D alive, FloatArray3D w
         cuda_check(cudaGetLastError());
 
         auto kernel = nca_step::backward_kernel<D::C, D::HID, D::FP32, D::STOCH, D::ALIVE>;
-        constexpr int smem = sizeof(nca_step::BackwardSmem<D::C, D::HID, nca_step::bwd_tile_h(D::STOCH)>);
+        constexpr int smem = sizeof(nca_step::BackwardSmem<D::C, D::HID, nca_step::BWD_TILE_H_MAX>);
         set_smem(kernel, smem);
-        const int blocks = backward_blocks_per_image(H, W, D::STOCH);
+        const int blocks = backward_blocks_per_image(H, W, D::STOCH, D::ALIVE);
         const size_t plane = H * W;
         const bool split = chunk < N;
         if (split)
