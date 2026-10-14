@@ -32,3 +32,4 @@ train:
 loss:
   n_samples: 1024       # feature positions per layer in the OT loss
   vgg_bf16: false       # VGG under bf16 autocast (~2x faster VGG forward / backward)
+  cache_targets: true   # compute the target terms of the unsampled layers once per group (fixed targets)

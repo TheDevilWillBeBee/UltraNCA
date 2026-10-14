@@ -1,9 +1,46 @@
 """OT texture loss on VGG16 features: relaxed EMD (cosine) + mean / covariance matching, summed over 5 layers.
 Same formulation as the OptimalTransportLoss of the HyperNCA project (independent random 1024-position subsets of
 the target and generated features per image), with the target features computed once instead of every call.
-bf16=True runs VGG under bf16 autocast in channels_last (~2x faster VGG; the OT terms stay fp32)."""
+VGG runs in channels_last (no layout conversions around the TF32 convolutions); bf16=True runs it under bf16
+autocast (~2x faster VGG; the OT terms stay fp32). The relaxed EMD has its own backward through the minimising
+pairs only (no dense (n, n) gradient)."""
 import torch
 import torchvision
+
+
+class _REMD(torch.autograd.Function):
+    """Relaxed EMD per item: max(mean_j min_i cos_ij, mean_i min_j cos_ij), cos_ij = 1 - x_i y_j / (|x_i| |y_j| + 1e-10),
+    for x (b, n, c) and y (b, m, c) (no gradient to y). Returns (b,)."""
+
+    @staticmethod
+    def forward(ctx, x, y):
+        nx, ny = x.norm(dim=2), y.norm(dim=2)
+        sim = x @ y.transpose(1, 2) / (nx[:, :, None] * ny[:, None, :] + 1e-10)  # 1 - cos
+        near_y, j = sim.max(2)  # per x_i: the nearest y_j
+        near_x, i = sim.max(1)  # per y_j: the nearest x_i
+        per_x, per_y = 1 - near_y.mean(1), 1 - near_x.mean(1)
+        ctx.save_for_backward(x, y, nx, ny, i, j, per_x > per_y)
+        return torch.maximum(per_x, per_y)
+
+    @staticmethod
+    def backward(ctx, g):
+        x, y, nx, ny, i, j, x_side = ctx.saved_tensors
+        b, n, c = x.shape
+
+        def dsim(xp, nxp, yp, nyp):  # gradient of sim(x_p, y_p) w.r.t. x_p, for pairs p: (b, p, c)
+            d = nxp * nyp + 1e-10
+            dot = (xp * yp).sum(2)
+            return yp / d[..., None] - (dot * nyp / (nxp * d * d)).nan_to_num(0, 0, 0)[..., None] * xp
+
+        gx = -(g / n)[:, None, None] * dsim(x, nx, y.gather(1, j[..., None].expand(-1, -1, c)), ny.gather(1, j))
+        gy_side = -(g / y.shape[1])[:, None, None] * dsim(x.gather(1, i[..., None].expand(-1, -1, c)), nx.gather(1, i), y, ny)
+        gx = torch.where(x_side[:, None, None], gx, torch.zeros_like(gx).scatter_add_(1, i[..., None].expand(-1, -1, c), gy_side))
+        return gx, None
+
+
+def _moments(y):  # (b, n, c) -> mean (b, 1, c), covariance (b, c, c)
+    m = y.mean(1, keepdim=True)
+    return m, (y - m).transpose(1, 2) @ (y - m) / (y.shape[1] - 1)
 
 
 class OTLoss(torch.nn.Module):
@@ -12,22 +49,27 @@ class OTLoss(torch.nn.Module):
     def __init__(self, n_samples=1024, bf16=False):
         super().__init__()
         self.vgg = torchvision.models.vgg16(weights='IMAGENET1K_V1').features[:26].eval().requires_grad_(False)
+        self.vgg = self.vgg.to(memory_format=torch.channels_last)
         self.n, self.bf16 = n_samples, bf16
-        if bf16:
-            self.vgg = self.vgg.to(memory_format=torch.channels_last)
         self.register_buffer('mean', torch.tensor([0.485, 0.456, 0.406])[:, None, None])
         self.register_buffer('std', torch.tensor([0.229, 0.224, 0.225])[:, None, None])
 
     def features(self, img):  # (b, 3, H, W) in [0, 1] -> list of (b, c, H*W)
-        x, feats = (img - self.mean) / self.std, []
-        if self.bf16:
-            x = x.contiguous(memory_format=torch.channels_last)
+        x, feats = ((img - self.mean) / self.std).contiguous(memory_format=torch.channels_last), []
         with torch.autocast('cuda', torch.bfloat16, enabled=self.bf16):
             for i, layer in enumerate(self.vgg):
                 x = layer(x)
                 if i in self.LAYERS:
                     feats.append(x.flatten(2).float())
         return feats
+
+    @torch.no_grad()
+    def targets(self, img, cache=True):
+        """The target side of the loss for target images (b0, 3, H, W): their features per layer. cache=True also
+        computes, for the layers whose positions are all used (no sampling), the per-target terms once
+        (features (b0, d, c), mean, covariance); with targets that change at every call, cache=False saves that work."""
+        return [(f.transpose(1, 2).contiguous(), *_moments(f.transpose(1, 2))) if cache and f.shape[2] <= self.n else f
+                for f in self.features(img)]
 
     def sample(self, f, rows):  # f (b0, c, d); rows (b,) picks a row of f per item -> (b, n, c)
         b, d = len(rows), f.shape[2]
@@ -36,17 +78,18 @@ class OTLoss(torch.nn.Module):
         idx = torch.rand(b, d, device=f.device).argsort(-1)[:, None, :self.n]
         return f[rows[:, None, None], torch.arange(f.shape[1], device=f.device)[None, :, None], idx].transpose(1, 2)
 
-    def forward(self, img, target_feats, target_rows):
-        """img (b, 3, H, W); target_feats = self.features(targets); target_rows (b,): target index of each image.
+    def forward(self, img, targets, target_rows):
+        """img (b, 3, H, W); targets = self.targets(target images); target_rows (b,): target index of each image.
         Returns the per-image loss (b,)."""
         rows = torch.arange(len(img), device=img.device)
         loss = 0.0
-        for fx, fy in zip(self.features(img), target_feats):
-            x, y = self.sample(fx, rows), self.sample(fy, target_rows)
-            cos = 1 - x @ y.transpose(1, 2) / (x.norm(dim=2)[:, :, None] * y.norm(dim=2)[:, None, :] + 1e-10)
-            remd = torch.maximum(cos.min(1)[0].mean(1), cos.min(2)[0].mean(1))
-            mx, my = x.mean(1, keepdim=True), y.mean(1, keepdim=True)
-            cx = (x - mx).transpose(1, 2) @ (x - mx) / (x.shape[1] - 1)
-            cy = (y - my).transpose(1, 2) @ (y - my) / (y.shape[1] - 1)
-            loss = loss + remd + (mx - my).abs().mean((1, 2)) + (cx - cy).abs().mean((1, 2))
+        for fx, t in zip(self.features(img), targets):
+            x = self.sample(fx, rows)
+            if isinstance(t, tuple):  # cached
+                y, my, cy = (v[target_rows] for v in t)
+            else:
+                y = self.sample(t, target_rows)
+                my, cy = _moments(y)
+            mx, cx = _moments(x)
+            loss = loss + _REMD.apply(x, y) + (mx - my).abs().mean((1, 2)) + (cx - cy).abs().mean((1, 2))
         return loss

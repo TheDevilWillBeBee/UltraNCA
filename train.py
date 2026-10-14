@@ -62,7 +62,7 @@ class Texture:
 
     def prepare(self, targets):  # (K, 3, S, S)
         with torch.no_grad():
-            self.target_feats = self.ot.features(targets)
+            self.target_feats = self.ot.targets(targets, self.cfg['loss']['cache_targets'])
 
     def loss(self, x):  # -> (objective, per-NCA loss (K,))
         K, B, C, S, _ = x.shape

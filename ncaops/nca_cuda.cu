@@ -102,9 +102,10 @@ static void launch_forward(const float *x, const float *w1, const float *b1, con
         static bool init = (set_smem(kernel, smem), true);
         (void)init;
         static const int blocks_per_sm = [&] { int b; cudaOccupancyMaxActiveBlocksPerMultiprocessor(&b, kernel, nca_step::FWD_THREADS, smem); return b; }();
-        // segments of whole columns, unless that gives less than two waves of blocks (shorter segments: more partial rounds)
+        // segments of whole columns, unless that gives less than two waves of blocks (shorter segments: more partial
+        // rounds); growing NCAs: at most 128 rows (segments without a living cell are skipped)
         const int strips = ceil_div(W, nca_step::TILE_W);
-        int seg = H;
+        int seg = D::ALIVE ? std::min<int>(H, 128) : H;
         while (seg > nca_step::FWD_PHASE && (size_t)N * strips * ceil_div(H, seg) < 2 * (size_t)blocks_per_sm * sm_count())
             seg = ceil_div(seg, 2);
         kernel<<<dim3(strips * ceil_div(H, seg), N), nca_step::FWD_THREADS, smem, stream>>>(

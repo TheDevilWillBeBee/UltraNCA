@@ -388,6 +388,15 @@ __global__ void __launch_bounds__(FWD_THREADS, fwd_min_blocks<C, HID, FP32>()) f
     const float *xn = x + n * C * plane;
     float *yn = y + n * C * plane, *an = ALIVE ? alpha + n * plane : nullptr;
     auto slot = [&](int Y) { return (Y - y0 + 1) % FWD_RING; };
+    if constexpr (ALIVE) {  // no alpha > 0.1 within 2 pixels of the segment: nothing to compute or write
+        bool any = false;
+        for (int i = threadIdx.x; i < (y1 - y0 + 4) * 20; i += FWD_THREADS) {
+            const int yy = y0 - 2 + i / 20, xx = x0 - 2 + i % 20;
+            any |= yy >= 0 && yy < H && xx >= 0 && xx < W && xn[3 * plane + (size_t)yy * W + xx] > 0.1f;
+        }
+        if (!__syncthreads_or(any))
+            return;
+    }
 
     // rows Y0 .. Y0 + rows - 1 (circular) of the strip with its halo columns, through registers: the loads of the
     // next phase are issued before the current phase's rounds. Thread i holds the (channel, halo column) pairs
