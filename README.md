@@ -109,9 +109,9 @@ All matmuls use `mma.sync.m16n8k8` TF32; a warp computes 16 pixels at a time (th
 | `forward_kernel` | A block sweeps a 16-pixel-wide column strip (a segment of rows) of an image: state rows go into a ring in shared memory (loads of the next phase issued before the current matmuls), the pixels that do not update copy x, and the updating ones are queued; every 128 queued pixels each of the 8 warps runs perception → h → relu → u on 16 of them. Weights are staged once per block in fragment-major order; h stays in registers between the two matmuls (permuted hidden index). Growing NCAs: rows and segments without a living cell within 2 pixels are skipped. |
 | `alive_kernel` | growing NCAs: alive mask from the old and new alpha (3×3 max-pools), y ×= mask, mask stored for the backward |
 | `pack_kernel` | per-NCA weights → B fragments for the backward matmuls |
-| `backward_kernel` | Per tile (6 rows × 16 when stochastic, else 4 × 16), the updating pixels in rounds of 4 groups of 16: recompute p and h; stage p, relu(h) and g·m in shared memory; dW2 += (g·m)ᵀ relu(h); then per hidden n-tile dh = (g·m)W2·[h>0] → db1 (shuffles), dp += dh W1 (→ global), dh staged; dW1 += pᵀ dh. Weight-gradient MMAs cover only the occupied pixel slots. 16/128 on 100 KB GPUs stages relu(h) / dh in two halves (2 blocks per SM). Writes an updating-pixel map instead of zeros in dp. |
+| `backward_kernel` | Per tile (6 rows × 16 when stochastic, else 4 × 16), the updating pixels in rounds of 4 groups of 16: recompute p and h; stage p, relu(h) and g·m in shared memory; dW2 += (g·m)ᵀ relu(h); then per hidden n-tile dh = (g·m)W2·[h>0] → db1 (shuffles), dp += dh W1, dh staged; dW1 += pᵀ dh. Weight-gradient MMAs cover only the occupied pixel slots. 16/128 on 100 KB GPUs stages relu(h) / dh in two halves (2 blocks per SM). dp is pixel-major (N, H, W, 4C) and written only at updating pixels (full 32-byte sectors), which an updating-pixel map marks. Weight B fragments are read in 16-byte pairs. |
 | `reduce_kernel` | sums the per-block partial weight gradients per NCA in a fixed order |
-| `adjoint_kernel` | dx = g(·a) + Σ_f K_fᵀ ⋆ dp_f (transpose of the circular 3×3 filters) over the updating pixels' dp; 4 pixels per thread |
+| `adjoint_kernel` | dx = g(·a) + Σ_f K_fᵀ ⋆ dp_f (transpose of the circular 3×3 filters) over the updating pixels' dp: thread (pixel, channel) reads the channel's 4 features of the 9 neighbours (16-byte loads), results transposed through shared memory for row-wise dx stores |
 
 The backward and adjoint run in chunks of images on two streams so that dp stays in L2. Inference (`nca_ops.rollout`) loops over steps in C++.
 
@@ -147,11 +147,13 @@ Per step, K = 32, B = 2, 128², update rate 0.5 (µs; "before" = the CUDA kernel
 
 | | forward before | forward now | backward before | backward now |
 |---|---|---|---|---|
-| texture 12/96 | 259 | 153 | 1054 | ~925 |
-| 16/128 (no alive mask) | 591 | 290 | 1880 | ~1550 |
-| growing 16/128 | 384 | 296 | 1212 | ~1125 |
+| texture 12/96 | 259 | 146 | 1054 | ~760 |
+| 16/128 (no alive mask) | 591 | 273 | 1880 | ~1360 |
+| growing 16/128 | 384 | 248 | 1212 | ~850 |
 
-Training, 32 targets, 768 iterations, `config.yml` / `config_growing.yml` schedule, K = 32 (s per NCA, compilation excluded): texture 3.05 → 2.6, growing 2.8 → 2.5. `benchmark.py train`: 111 ms per texture iteration (OT loss about 40 ms of it), 80 ms per growing iteration.
+The backward kernel alone runs at about 45 % of the TF32 tensor peak (82.6 TFLOPS); its stalls are mostly weight-fragment loads (the per-NCA fragments, 42 / 72 KB, do not fit the ~28 KB of L1 left next to 98 KB of shared memory), the tensor pipe and barriers.
+
+Training, 32 targets, 768 iterations, `config.yml` / `config_growing.yml` schedule, K = 32 (s per NCA, compilation excluded): texture 3.05 → 2.6, growing 2.8 → 2.5 (before the pixel-major dp). `benchmark.py train`: 130.8 → 96.5 ms per texture iteration (OT loss about 40 ms of it), 85.8 → 57.1 ms per growing iteration.
 
 OT loss (compiled, forward + backward, 64 images of 128²): 47.0 → 39.9 ms with TF32 VGG, 26.1 ms with `vgg_bf16: true`. The relaxed-EMD backward now goes through the minimising pairs only (no dense 1024² gradient), VGG runs in channels_last, and `cache_targets` computes the target terms of the unsampled layers once (turn it off when the targets change at every call). bf16 VGG was checked on 32 textures × 2 seeds: training 11 % faster, OT loss evaluated in fp32 within seed noise (+1–2 % on average), previews indistinguishable; it stays opt-in.
 
@@ -171,7 +173,7 @@ Growing at 2048² is dominated by `alive_kernel` writing zeros to the dead cells
 ## Planned next steps (in rough order of expected gain)
 
 1. **Fuse the adjoint into the backward kernel** (no dp round trip). Staging a tile's dp needs about 20 KB more shared memory per block: it fits on the A100 / H100, but on 100 KB GPUs it would cost the second block per SM.
-2. **Backward register pressure**: 255 registers with small spills (16/128), 8 warps per SM. The 16/128 backward at update rate 1 is currently about 10 % slower than before the updating-pixel rework (instruction scheduling).
+2. **Backward occupancy**: 255 registers and ~49 KB of shared memory per 4-warp block give 8 warps per SM. Tried and dropped: two warps per pixel group (8-warp blocks at 128 registers, 16 warps per SM): twice the instructions per MMA (duplicated perception, masks, dh, fragment loads), 15–30 % slower; a 168-register cap (spills); more or fewer tiles per block (no change). On GPUs with more shared memory (A100 / H100), staging the weight fragments in shared memory would remove the L1 misses.
 3. **OT loss**: VGG is now about 33 of its 40 ms; bf16 VGG (validated, opt-in) halves it.
 4. **Sparse growing grids**: skip the zero writes of dead cells (e.g. track the live bounding box) for very large, mostly empty grids.
 5. **Other GPUs**: H100 `wgmma`; other (C, HID) instantiations (`dispatch()` in `nca_cuda.cu`; C a multiple of 4, HID a multiple of 32).
