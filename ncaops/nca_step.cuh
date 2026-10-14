@@ -643,7 +643,7 @@ __global__ void alive_kernel(const float *__restrict__ x, const float *__restric
 // dp = 0: dp is not written there, the kernel marks them in an updating map) in rounds of 16 pixels per warp (the MMA
 // rows): recompute p and h = W1 p + b1, stage p, relu(h) and g*m in shared memory, then
 //   dh = (g * m) W2 * [h > 0]          (MMA, registers); db1 += sum of dh over the pixels (warp shuffles)
-//   dp = dh W1                          (MMA, permuted hidden index as in the forward) -> global (N, 4C, H, W)
+//   dp = dh W1                          (MMA, permuted hidden index as in the forward) -> global (N, H, W, 4C)
 //   dW2 += (g * m)^T relu(h),  dW1 += dh^T p   (MMA over the pixels of the tile, per-block accumulators)
 // Each block writes its weight-gradient partials; reduce_kernel sums them per NCA in a fixed order (deterministic).
 // adjoint_kernel then forms dx = g + sum_f K_f^T * dp_f (transpose of the circular 3x3 filters).
@@ -686,13 +686,20 @@ struct BwdShape {
     static_assert(CPAD >= 8 * NT2, "channel padding");
 };
 
-// Per-NCA B fragments for the backward matmuls (packed by pack_kernel).
+// Two B fragments of consecutive k-steps / n-tiles (one 16-byte load per lane).
+template <bool FP32>
+struct FragB2 {
+    uint4 v;
+    __device__ __forceinline__ FragB<FP32> operator[](int i) const { return {i ? make_uint2(v.z, v.w) : make_uint2(v.x, v.y)}; }
+};
+
+// Per-NCA B fragments for the backward matmuls (packed by pack_kernel), in pairs of consecutive k-steps / n-tiles.
 template <int C, int HID, bool FP32>
 struct BackwardWeights {
     using BS = BwdShape<C, HID>;
-    FragB<FP32> w1h[BS::NT1][BS::KS1][32];   // h = W1 p: b0 = W1[8j+g][feature(s, t)], b1 = W1[8j+g][feature(s, t+4)]
-    FragB<FP32> w2d[BS::NT2][BS::NT1][32];   // dh = gm W2: b0 = W2[8q+t][8j+g], b1 = W2[8q+t+4][8j+g]
-    FragB<FP32> w1p[BS::NT1][BS::NTP][32];   // dp = dh W1: b0 = W1[8j+2t][8n+g], b1 = W1[8j+2t+1][8n+g]
+    FragB2<FP32> w1h[BS::NT1][BS::KS1 / 2][32];         // h = W1 p: b0 = W1[8j+g][feature(s, t)], b1 = W1[8j+g][feature(s, t+4)]
+    FragB2<FP32> w2d[BS::NT1][(BS::NT2 + 1) / 2][32];   // dh = gm W2: b0 = W2[8q+t][8j+g], b1 = W2[8q+t+4][8j+g]
+    FragB2<FP32> w1p[BS::NT1][BS::NTP / 2][32];         // dp = dh W1: b0 = W1[8j+2t][8n+g], b1 = W1[8j+2t+1][8n+g]
     float b1[HID];
 };
 
@@ -704,18 +711,24 @@ __global__ void pack_kernel(const float *__restrict__ w1, const float *__restric
     const int k = blockIdx.x;
     w1 += (size_t)k * HID * BS::PIN; b1 += (size_t)k * HID; w2 += (size_t)k * C * HID;
     auto &pk = packed[k];
+    auto put = [](FragB2<FP32> &pair, int i, float b0, float b1) {  // fragment i of the pair
+        FragB<FP32> f;
+        make_frag<FP32>(f, b0, b1);
+        (i ? pair.v.z : pair.v.x) = f.v.x;
+        (i ? pair.v.w : pair.v.y) = f.v.y;
+    };
     for (int i = threadIdx.x; i < BS::NT1 * BS::KS1 * 32; i += blockDim.x) {
         const int lane = i % 32, s = (i / 32) % BS::KS1, j = i / (32 * BS::KS1), g = lane / 4, t = lane % 4;
-        make_frag<FP32>(pk.w1h[j][s][lane], w1[(8 * j + g) * BS::PIN + feature(s, t)], w1[(8 * j + g) * BS::PIN + feature(s, t + 4)]);
+        put(pk.w1h[j][s / 2][lane], s % 2, w1[(8 * j + g) * BS::PIN + feature(s, t)], w1[(8 * j + g) * BS::PIN + feature(s, t + 4)]);
     }
-    for (int i = threadIdx.x; i < BS::NT2 * BS::NT1 * 32; i += blockDim.x) {
+    for (int i = threadIdx.x; i < (BS::NT2 + 1) / 2 * 2 * BS::NT1 * 32; i += blockDim.x) {
         const int lane = i % 32, j = (i / 32) % BS::NT1, q = i / (32 * BS::NT1), g = lane / 4, t = lane % 4;
         const int c0 = 8 * q + t, c1 = 8 * q + t + 4;
-        make_frag<FP32>(pk.w2d[q][j][lane], c0 < C ? w2[c0 * HID + 8 * j + g] : 0.f, c1 < C ? w2[c1 * HID + 8 * j + g] : 0.f);
+        put(pk.w2d[j][q / 2][lane], q % 2, c0 < C ? w2[c0 * HID + 8 * j + g] : 0.f, c1 < C ? w2[c1 * HID + 8 * j + g] : 0.f);
     }
     for (int i = threadIdx.x; i < BS::NT1 * BS::NTP * 32; i += blockDim.x) {
         const int lane = i % 32, nt = (i / 32) % BS::NTP, j = i / (32 * BS::NTP), g = lane / 4, t = lane % 4;
-        make_frag<FP32>(pk.w1p[j][nt][lane], w1[(8 * j + 2 * t) * BS::PIN + 8 * nt + g], w1[(8 * j + 2 * t + 1) * BS::PIN + 8 * nt + g]);
+        put(pk.w1p[j][nt / 2][lane], nt % 2, w1[(8 * j + 2 * t) * BS::PIN + 8 * nt + g], w1[(8 * j + 2 * t + 1) * BS::PIN + 8 * nt + g]);
     }
     for (int i = threadIdx.x; i < HID; i += blockDim.x)
         pk.b1[i] = b1[i];
@@ -837,8 +850,11 @@ __global__ void __launch_bounds__(BWD_THREADS, BWD_MIN_BLOCKS) backward_kernel(
                 for (int j = 0; j < BS::NT1; ++j) {
                     float h[4] = {wk.b1[8 * j + 2 * t], wk.b1[8 * j + 2 * t + 1], wk.b1[8 * j + 2 * t], wk.b1[8 * j + 2 * t + 1]};
 #pragma unroll
-                    for (int s = 0; s < BS::KS1; ++s)
-                        mma<FP32>(h, a[s], wk.w1h[j][s][lane]);
+                    for (int s = 0; s < BS::KS1; s += 2) {
+                        const FragB2<FP32> b = wk.w1h[j][s / 2][lane];
+                        mma<FP32>(h, a[s], b[0]);
+                        mma<FP32>(h, a[s + 1], b[1]);
+                    }
 #pragma unroll
                     for (int e = 0; e < 4; ++e) {
                         if (h[e] > 0.f)
@@ -864,7 +880,7 @@ __global__ void __launch_bounds__(BWD_THREADS, BWD_MIN_BLOCKS) backward_kernel(
                 dh[0] = dh[1] = dh[2] = dh[3] = 0.f;
 #pragma unroll
                 for (int q = 0; q < BS::NT2; ++q)
-                    mma<FP32>(dh, ag[q], wk.w2d[q][j][lane]);
+                    mma<FP32>(dh, ag[q], wk.w2d[j][q / 2][lane][q % 2]);
 #pragma unroll
                 for (int e = 0; e < 4; ++e)
                     if (!((positive >> (4 * j + e)) & 1u))
@@ -917,22 +933,24 @@ __global__ void __launch_bounds__(BWD_THREADS, BWD_MIN_BLOCKS) backward_kernel(
                     Op4<FP32> ad;
                     ad.set(0, dh[0]); ad.set(1, dh[2]); ad.set(2, dh[1]); ad.set(3, dh[3]);
 #pragma unroll
-                    for (int nt = 0; nt < BS::NTP; ++nt)
-                        mma<FP32>(d[nt], ad, wk.w1p[j][nt][lane]);
+                    for (int nt = 0; nt < BS::NTP; nt += 2) {
+                        const FragB2<FP32> b = wk.w1p[j][nt / 2][lane];
+                        mma<FP32>(d[nt], ad, b[0]);
+                        mma<FP32>(d[nt + 1], ad, b[1]);
+                    }
                     if (j < BS::NTH)
 #pragma unroll
                         for (int e = 0; e < 4; ++e)
                             sm.h(16 * warp + g + 8 * (e / 2), 8 * j + 2 * t + e % 2) = staged<FP32>(dh[e]);
                 }
-                if (!(NCA_ABLATE & 2))
+                if (!(NCA_ABLATE & 2))  // pixel-major: lanes t write a pixel's 8 features of an n-tile (one sector)
 #pragma unroll
                     for (int h = 0; h < 2; ++h)
                         if (valid[h])
 #pragma unroll
                             for (int nt = 0; nt < BS::NTP; ++nt)
-#pragma unroll
-                                for (int e = 0; e < 2; ++e)
-                                    dpn[(8 * nt + 2 * t + e) * plane + (size_t)(y0 + pr[h]) * W + x0 + pc[h]] = d[nt][2 * h + e];
+                                *reinterpret_cast<float2 *>(dpn + ((size_t)(y0 + pr[h]) * W + x0 + pc[h]) * BS::PIN + 8 * nt + 2 * t) =
+                                    make_float2(d[nt][2 * h], d[nt][2 * h + 1]);
                 if constexpr (BS::HPARTS == 2)  // p again (cheap), into the buffer that held relu(h)
                     sm.x.template perceive_all<BS::KS1>(pr[0], pc[0], pr[1], pc[1], t, stage_p);
             }
@@ -1030,77 +1048,53 @@ __global__ void reduce_kernel(const float *__restrict__ partial, int blocks_per_
         dw2[(size_t)k * C * HID + e - HID * (BS::PIN + 1)] = s;
 }
 
-// dx = g (* a) + sum_f sum_o K_f(o) dp_{4c+f}(y - o), the transpose of the circular perception filters. One thread
-// per (4 neighbouring pixels of a row, channel): for each tap row of a dp plane it loads the 4 pixels (one float4 if
-// W % 4 == 0) and their 2 neighbours, a third of the loads of one thread per pixel. Taps are served by L1.
+// dx = g (* a) + sum_o sum_f K_f(o) dp_{4c+f}(y - o), the transpose of the circular perception filters, over the
+// updating pixels' dp (pixel-major, (N, H, W, 4C); not written elsewhere). A block takes 32 consecutive pixels of an
+// image and all C channels: thread (pixel, c) reads the 4 features of channel c of the 9 neighbours (16-byte loads; the
+// C threads of a pixel read its 4C features contiguously); the sums go through shared memory so that dx is written
+// by rows.
 template <int C, bool ALIVE>
-__global__ void __launch_bounds__(256) adjoint_kernel(const float *__restrict__ dp, const uint8_t *__restrict__ updating,
-                                                      const float *__restrict__ gy, const uint8_t *__restrict__ alive,
-                                                      float *__restrict__ gx, int H, int W, uint64_t total)  // total = images * C * H * W4
+__global__ void __launch_bounds__(32 * C) adjoint_kernel(const float *__restrict__ dp, const uint8_t *__restrict__ updating,
+                                                         const float *__restrict__ gy, const uint8_t *__restrict__ alive,
+                                                         float *__restrict__ gx, int H, int W)  // grid (pixels / 32, images)
 {
-    const uint64_t i = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x;
-    if (i >= total)
-        return;
-    const int W4 = (W + 3) / 4, X0 = 4 * (i % W4), Y = (i / W4) % H;
-    const uint64_t nc = i / ((uint64_t)H * W4), n = nc / C, c = nc % C, plane = (uint64_t)H * W;
-    const float *d = dp + (n * 4 * C + 4 * c) * plane;
-    const uint8_t *up = updating + n * plane;
-    const bool vec = W % 4 == 0;
-    // pixels X0 - 1 .. X0 + 4 of row yy of plane P (circular); 0 where `on` (the updating map of the row) is 0
-    auto load_row = [&](const float *P, int yy, const bool (&on)[6], float (&v)[6]) {
-        P += (uint64_t)yy * W;
-        if (vec) {
-            const float4 m = __ldg(reinterpret_cast<const float4 *>(P + X0));
-            v[1] = m.x; v[2] = m.y; v[3] = m.z; v[4] = m.w;
-        } else {
+    __shared__ float sum[C][33];
+    const uint64_t n = blockIdx.y, plane = (uint64_t)H * W;
+    {
+        const int c = threadIdx.x % C, i = threadIdx.x / C;
+        const uint64_t P = blockIdx.x * 32ull + i;
+        float v = 0.f;
+        if (P < plane) {
+            const int Y = P / W, X = P % W;
 #pragma unroll
-            for (int k = 0; k < 4; ++k)
-                v[k + 1] = __ldg(P + (X0 + k) % W);
+            for (int dy = 0; dy < 3; ++dy) {
+                int yy = Y + 1 - dy;
+                yy = yy < 0 ? yy + H : (yy >= H ? yy - H : yy);
+#pragma unroll
+                for (int dx = 0; dx < 3; ++dx) {
+                    int xx = X + 1 - dx;
+                    xx = xx < 0 ? xx + W : (xx >= W ? xx - W : xx);
+                    const uint64_t q = n * plane + (uint64_t)yy * W + xx;
+                    if (updating[q]) {
+                        const float4 d = __ldg(reinterpret_cast<const float4 *>(dp + q * 4 * C) + c);
+                        const float f[4] = {d.x, d.y, d.z, d.w};
+#pragma unroll
+                        for (int k = 0; k < 4; ++k)
+                            if (filter_tap(k, 3 * dy + dx) != 0.f)
+                                v = fmaf(filter_tap(k, 3 * dy + dx), f[k], v);
+                    }
+                }
+            }
         }
-        v[0] = __ldg(P + (X0 == 0 ? W - 1 : X0 - 1));
-        v[5] = __ldg(P + (X0 + 4 >= W ? X0 + 4 - W : X0 + 4));
-#pragma unroll
-        for (int k = 0; k < 6; ++k)
-            v[k] = on[k] ? v[k] : 0.f;
-    };
-    float out[4] = {};
-#pragma unroll
-    for (int dy = 0; dy < 3; ++dy) {
-        int yy = Y + 1 - dy;
-        yy = yy < 0 ? yy + H : (yy >= H ? yy - H : yy);
-        bool on[6];
-        const uint8_t *u = up + (uint64_t)yy * W;
-        if (vec) {
-            const uchar4 m = *reinterpret_cast<const uchar4 *>(u + X0);
-            on[1] = m.x; on[2] = m.y; on[3] = m.z; on[4] = m.w;
-        } else {
-#pragma unroll
-            for (int k = 0; k < 4; ++k)
-                on[k + 1] = u[(X0 + k) % W];
-        }
-        on[0] = u[X0 == 0 ? W - 1 : X0 - 1];
-        on[5] = u[X0 + 4 >= W ? X0 + 4 - W : X0 + 4];
-#pragma unroll
-        for (int f = 0; f < 4; ++f) {
-            if (filter_tap(f, 3 * dy) == 0.f && filter_tap(f, 3 * dy + 1) == 0.f && filter_tap(f, 3 * dy + 2) == 0.f)
-                continue;  // no taps in this row of the filter
-            float v[6];
-            load_row(d + f * plane, yy, on, v);
-#pragma unroll
-            for (int k = 0; k < 4; ++k)
-#pragma unroll
-                for (int dx = 0; dx < 3; ++dx)  // tap (dy, dx) reads pixel X0 + k + 1 - dx = v[k + 2 - dx]
-                    if (filter_tap(f, 3 * dy + dx) != 0.f)
-                        out[k] = fmaf(filter_tap(f, 3 * dy + dx), v[k + 2 - dx], out[k]);
-        }
+        sum[c][i] = v;
     }
-    const uint64_t o = nc * plane + (uint64_t)Y * W + X0;
-#pragma unroll
-    for (int k = 0; k < 4; ++k)
-        if (X0 + k < W) {
-            const float g = ALIVE ? (alive[n * plane + (uint64_t)Y * W + X0 + k] ? gy[o + k] : 0.f) : gy[o + k];
-            gx[o + k] = g + out[k];
-        }
+    __syncthreads();
+    const int i = threadIdx.x % 32, c = threadIdx.x / 32;
+    const uint64_t P = blockIdx.x * 32ull + i;
+    if (P < plane) {
+        const uint64_t o = (n * C + c) * plane + P;
+        gx[o] = (ALIVE && !alive[n * plane + P] ? 0.f : gy[o]) + sum[c][i];
+    }
 }
 
 }  // namespace nca_step

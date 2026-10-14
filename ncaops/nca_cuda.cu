@@ -259,7 +259,7 @@ void backward(FloatArray4D x, FloatArray4D gy, ByteArray3D alive, FloatArray3D w
     const size_t chunk = dp.shape(0) >= N ? N : dp.shape(0) / 2;
     if (chunk == 0 || (chunk < N && dp.shape(0) % 2))
         throw std::runtime_error("dp must hold N images or two chunks of images");
-    validate_array_shape(dp, {chunk < N ? 2 * chunk : N, 4 * C, H, W}, "dp");
+    validate_array_shape(dp, {chunk < N ? 2 * chunk : N, H, W, 4 * C}, "dp");
     validate_array_shape(packed, {K * packed_bytes}, "packed");
     validate_array_shape(partial, {N * partial_floats}, "partial");
     validate_array_shape(updating, {N, H, W}, "updating");
@@ -291,10 +291,9 @@ void backward(FloatArray4D x, FloatArray4D gy, ByteArray3D alive, FloatArray3D w
                                                                        updating.data(), partial.data(), n0, batch_per_nca,
                                                                        H, W, seed, update_rate);
             cuda_check(cudaGetLastError());
-            const uint64_t total = (uint64_t)n * D::C * H * ceil_div(W, 4);  // 4 pixels per thread
-            nca_step::adjoint_kernel<D::C, D::ALIVE><<<(unsigned)((total + 255) / 256), 256, 0, s>>>(
+            nca_step::adjoint_kernel<D::C, D::ALIVE><<<dim3(ceil_div(H * W, 32), n), 32 * D::C, 0, s>>>(
                 dpc, updating.data() + n0 * plane, gy.data() + n0 * D::C * plane, alive.data() + (growing ? n0 * plane : 0),
-                gx.data() + n0 * D::C * plane, H, W, total);
+                gx.data() + n0 * D::C * plane, H, W);
             cuda_check(cudaGetLastError());
         }
         if (split)
@@ -331,7 +330,7 @@ NB_MODULE(nca_cuda, m)
     m.def("backward", &backward, "x"_a, "gy"_a, "alive"_a, "w1"_a, "b1"_a, "w2"_a, "gx"_a, "dw1"_a, "db1"_a, "dw2"_a,
           "packed"_a, "dp"_a, "updating"_a, "partial"_a, "batch_per_nca"_a, "seed"_a, "update_rate"_a, "fp32"_a, "growing"_a, "stream"_a,
           "Gradients of one NCA step (same seed, update_rate and, if growing, alive mask as the forward). Writes gx, dw1, db1, dw2; packed, dp and partial "
-          "are workspaces sized by backward_workspace(): dp holds all N images (one launch) or two chunks of images; updating (N, H, W) marks the updating pixels (dp = 0 elsewhere, not written). Weight gradients are reduced in a fixed order.");
+          "are workspaces sized by backward_workspace(): dp (pixel-major: (images, H, W, 4C)) holds all N images (one launch) or two chunks of images; updating (N, H, W) marks the updating pixels (dp = 0 elsewhere, not written). Weight gradients are reduced in a fixed order.");
     m.def("update_mask", &update_mask, "mask"_a, "seed"_a, "update_rate"_a,
           "The stochastic update mask used by forward / backward: mask (N, H, W) = floor(U + update_rate).");
 }
