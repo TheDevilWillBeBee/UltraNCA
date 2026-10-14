@@ -1,9 +1,10 @@
 """Train one NCA per target image, several NCAs at a time in a single forward / backward pass.
 
 Tasks (config `task`):
-- texture (config.yml): texture NCA, OT texture loss + overflow penalty, zero seed injected every few iterations;
+- texture (config.yml): texture NCA, OT texture loss + overflow penalty, zero seed;
 - growing (config_growing.yml): growing NCA (Distill "Growing Neural Cellular Automata"): alive mask on alpha =
-  channel 3, L2 to the premultiplied RGBA target, single-cell seed replacing the worst sample of each batch.
+  channel 3, L2 to the premultiplied RGBA target, single living cell as the seed.
+The seed replaces the first sample of each NCA's batch every few iterations.
 Each NCA has its own target, pool, batch, loss and per-tensor gradient normalisation, exactly as if trained alone
 (Adam, step lr decay). The states of the group are stacked as (K, B, C, H, W) and the per-NCA 1x1 layers run as
 batched matmuls (impl: eager), optionally torch.compile'd (impl: compile), as a fused Triton kernel (impl: triton,
@@ -63,10 +64,6 @@ class Texture:
         with torch.no_grad():
             self.target_feats = self.ot.features(targets)
 
-    def inject(self, i, x):
-        if i % self.cfg['train']['inject_every'] == 0:
-            x[:, 0] = 0
-
     def loss(self, x):  # -> (objective, per-NCA loss (K,))
         K, B, C, S, _ = x.shape
         rows = torch.arange(K, device=dev).repeat_interleave(B)  # target of each image in the (K * B) batch
@@ -97,16 +94,8 @@ class Growing:
     def prepare(self, targets):  # (K, 4, S, S)
         self.targets = targets[:, None]
 
-    def per_sample(self, x):
-        return (x[:, :, :4] - self.targets).square().mean((2, 3, 4))  # (K, B)
-
-    def inject(self, i, x):  # replace the worst sample of each batch by the seed
-        with torch.no_grad():
-            worst = self.per_sample(x).argmax(1)
-            x[torch.arange(len(x), device=dev), worst] = self.seed(len(x), 1)[:, 0]
-
     def loss(self, x):
-        loss = self.per_sample(x).mean(1)
+        loss = (x[:, :, :4] - self.targets).square().mean((1, 2, 3, 4))  # (K,)
         return loss.sum(), loss.detach()
 
     def preview(self, target, x):  # target | NCA, composited on white, (3, S, 2S)
@@ -144,7 +133,8 @@ def train_group(targets, init, cfg, task, step_fn):
     for i in range(t['iterations']):
         idx = torch.rand(K, P, device=dev).argsort(1)[:, :B]  # B distinct pool entries per NCA
         x = pool[ks, idx]
-        task.inject(i, x)
+        if i % t['inject_every'] == 0:  # the first sample of each NCA's batch restarts from the seed
+            x[:, 0] = task.seed(K, 1)[:, 0]
         for _ in range(np.random.randint(*t['rollout'])):
             x = step_fn(x, w1, b1, w2)
         objective, loss = task.loss(x)

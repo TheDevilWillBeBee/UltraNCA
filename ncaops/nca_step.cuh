@@ -363,15 +363,21 @@ __global__ void __launch_bounds__(FWD_THREADS) forward_kernel(
                 for (int e = 0; e < 4; ++e)
                     h[j][e] = fmaxf(h[j][e], 0.f);
             // u = W2 h: accumulator columns (2t, 2t + 1) of n-tile j are the A columns (t, t + 4) of k-step j.
-            float u[S::NT2][4] = {};
+            float u2[2][S::NT2][4] = {};  // even / odd k-steps: twice the independent MMA chains
 #pragma unroll
             for (int j = 0; j < S::NT1; ++j) {
                 Op4<FP32> ah;
                 ah.set(0, h[j][0]); ah.set(1, h[j][2]); ah.set(2, h[j][1]); ah.set(3, h[j][3]);
 #pragma unroll
                 for (int nt = 0; nt < S::NT2; ++nt)
-                    mma<FP32>(u[nt], ah, sm.w2[nt][j][lane]);
+                    mma<FP32>(u2[j % 2][nt], ah, sm.w2[nt][j][lane]);
             }
+            float u[S::NT2][4];
+#pragma unroll
+            for (int nt = 0; nt < S::NT2; ++nt)
+#pragma unroll
+                for (int e = 0; e < 4; ++e)
+                    u[nt][e] = u2[0][nt][e] + u2[1][nt][e];
             // y = x + u * m for pixels g, g + 8 and channels 8nt + 2t, 8nt + 2t + 1
             const int gy = y0 + row;
 #pragma unroll

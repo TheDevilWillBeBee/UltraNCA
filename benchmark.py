@@ -1,7 +1,7 @@
 """Benchmarks of the NCA step on the current GPU (TF32, warm-up / compilation excluded).
   train: steady-state cost of one training iteration of train.py (a rollout of the mean training length, forward +
-         backward, plus the loss) for K NCAs: texture (config.yml: B = 2, 128 x 128, 64 steps, OT loss) and growing
-         (config_growing.yml: B = 8, 72 x 72, 80 steps, L2 loss). Growing weights and states: trained NCAs from
+         backward, plus the loss) for K NCAs: texture (config.yml: 12 / 96, B = 2, 128 x 128, 64 steps, OT loss) and
+         growing (config_growing.yml: 16 / 128, same schedule, L2 loss). Growing weights and states: trained NCAs from
          --growing_weights (runs/emoji, as written by train.py) if present, else random (no growth: unrepresentative
          alive areas).
   infer: forward-only rollouts (no grad) of 256 steps: K NCAs x 1 sample at 64^2 and 128^2, then one NCA at several

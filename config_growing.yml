@@ -1,12 +1,12 @@
-task: growing                            # growing NCA (Distill "Growing Neural Cellular Automata"); see config.yml for texture
+task: growing                            # growing NCA (alive mask, L2 to the RGBA target); the schedule is that of config.yml
 targets: data/emoji                      # RGBA .png targets, see prepare/download_emoji.py
 num_targets: 64                          # the first n targets (sorted by name); null: all
 out_dir: runs/emoji
 init: null                               # as in config.yml
-img_size: 40                             # target size; the grid is img_size + 2 * pad
+img_size: 96                             # target size; the grid is img_size + 2 * pad = 128
 pad: 16
 seed: 0
-preview_steps: 200
+preview_steps: 256
 
 nca:
   channels: 16                           # alpha = channel 3
@@ -15,12 +15,13 @@ nca:
 
 train:
   group_size: 32
-  batch_size: 8
-  iterations: 4000
-  pool_size: 256
-  lr: 2.0e-3
-  milestones: [2000]
-  gamma: 0.1
-  rollout: [64, 97]
+  batch_size: 2
+  iterations: 768
+  pool_size: 64
+  lr: 1.0e-3
+  milestones: [256, 512]
+  gamma: 0.5
+  rollout: [32, 96]
+  inject_every: 16
   tf32: true
   impl: cuda                             # eager | compile | cuda
