@@ -631,8 +631,8 @@ __global__ void alive_kernel(const float *__restrict__ x, const float *__restric
 
 // ================================================================ backward
 // Main kernel, on the updating pixels of a block tile (m = 1 and, if growing, alive after the step; the others have
-// dp = 0) in rounds of 16 pixels per warp (the MMA rows): recompute p and h = W1 p + b1, stage p, relu(h) and g*m
-// in shared memory, then
+// dp = 0: dp is not written there, the kernel marks them in an updating map) in rounds of 16 pixels per warp (the MMA
+// rows): recompute p and h = W1 p + b1, stage p, relu(h) and g*m in shared memory, then
 //   dh = (g * m) W2 * [h > 0]          (MMA, registers); db1 += sum of dh over the pixels (warp shuffles)
 //   dp = dh W1                          (MMA, permuted hidden index as in the forward) -> global (N, 4C, H, W)
 //   dW2 += (g * m)^T relu(h),  dW1 += dh^T p   (MMA over the pixels of the tile, per-block accumulators)
@@ -744,8 +744,8 @@ __device__ __forceinline__ FragB<FP32> frag_from_staged(float b0, float b1)
 template <int C, int HID, bool FP32, bool STOCH, bool ALIVE>
 __global__ void __launch_bounds__(BWD_THREADS, BWD_MIN_BLOCKS) backward_kernel(
     const float *__restrict__ x, const float *__restrict__ gy, const uint8_t *__restrict__ alive,
-    const BackwardWeights<C, HID, FP32> *__restrict__ packed, float *__restrict__ dp, float *__restrict__ partial,
-    int n0, int B, int H, int W, uint64_t seed, float update_rate)
+    const BackwardWeights<C, HID, FP32> *__restrict__ packed, float *__restrict__ dp, uint8_t *__restrict__ updating,
+    float *__restrict__ partial, int n0, int B, int H, int W, uint64_t seed, float update_rate)
 {
     using BS = BwdShape<C, HID>;
     constexpr int TH = bwd_tile_h(STOCH), TPIX = TH * TILE_W, WORDS = (TPIX + 31) / 32;
@@ -782,17 +782,17 @@ __global__ void __launch_bounds__(BWD_THREADS, BWD_MIN_BLOCKS) backward_kernel(
             count += __popc(words[w]);
         }
         __syncthreads();  // previous tile's shared reads are complete
-        if (threadIdx.x < TPIX) {  // pixel list (in order); dp = 0 at the pixels that do not update
+        if (threadIdx.x < TPIX) {  // pixel list (in order); the updating map (dp is only written at updating pixels)
             const int px = threadIdx.x, w = px / 32, Y = y0 + px / TILE_W, X = x0 + px % TILE_W;
             int rank = __popc(words[w] & ((1u << px % 32) - 1));
 #pragma unroll
             for (int v = 0; v < WORDS; ++v)
                 rank += v < w ? __popc(words[v]) : 0;
-            if ((words[w] >> px % 32) & 1u)
+            const bool up = (words[w] >> px % 32) & 1u;
+            if (up)
                 sm.pixels[rank] = px;
-            else if (Y < H && X < W)
-                for (int f = 0; f < BS::PIN; ++f)
-                    dpn[f * plane + (size_t)Y * W + X] = 0.f;
+            if (Y < H && X < W)
+                updating[(size_t)n * plane + (size_t)Y * W + X] = up;
         }
         if (count == 0)
             continue;
@@ -1025,9 +1025,9 @@ __global__ void reduce_kernel(const float *__restrict__ partial, int blocks_per_
 // per (4 neighbouring pixels of a row, channel): for each tap row of a dp plane it loads the 4 pixels (one float4 if
 // W % 4 == 0) and their 2 neighbours, a third of the loads of one thread per pixel. Taps are served by L1.
 template <int C, bool ALIVE>
-__global__ void __launch_bounds__(256) adjoint_kernel(const float *__restrict__ dp, const float *__restrict__ gy,
-                                                      const uint8_t *__restrict__ alive, float *__restrict__ gx,
-                                                      int H, int W, uint64_t total)  // total = images * C * H * W4
+__global__ void __launch_bounds__(256) adjoint_kernel(const float *__restrict__ dp, const uint8_t *__restrict__ updating,
+                                                      const float *__restrict__ gy, const uint8_t *__restrict__ alive,
+                                                      float *__restrict__ gx, int H, int W, uint64_t total)  // total = images * C * H * W4
 {
     const uint64_t i = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x;
     if (i >= total)
@@ -1035,9 +1035,10 @@ __global__ void __launch_bounds__(256) adjoint_kernel(const float *__restrict__ 
     const int W4 = (W + 3) / 4, X0 = 4 * (i % W4), Y = (i / W4) % H;
     const uint64_t nc = i / ((uint64_t)H * W4), n = nc / C, c = nc % C, plane = (uint64_t)H * W;
     const float *d = dp + (n * 4 * C + 4 * c) * plane;
+    const uint8_t *up = updating + n * plane;
     const bool vec = W % 4 == 0;
-    // pixels X0 - 1 .. X0 + 4 of row yy of plane P (circular)
-    auto load_row = [&](const float *P, int yy, float (&v)[6]) {
+    // pixels X0 - 1 .. X0 + 4 of row yy of plane P (circular); 0 where `on` (the updating map of the row) is 0
+    auto load_row = [&](const float *P, int yy, const bool (&on)[6], float (&v)[6]) {
         P += (uint64_t)yy * W;
         if (vec) {
             const float4 m = __ldg(reinterpret_cast<const float4 *>(P + X0));
@@ -1048,19 +1049,34 @@ __global__ void __launch_bounds__(256) adjoint_kernel(const float *__restrict__ 
                 v[k + 1] = __ldg(P + (X0 + k) % W);
         }
         v[0] = __ldg(P + (X0 == 0 ? W - 1 : X0 - 1));
-        v[5] = __ldg(P + (X0 + 4) % W);
+        v[5] = __ldg(P + (X0 + 4 >= W ? X0 + 4 - W : X0 + 4));
+#pragma unroll
+        for (int k = 0; k < 6; ++k)
+            v[k] = on[k] ? v[k] : 0.f;
     };
     float out[4] = {};
 #pragma unroll
     for (int dy = 0; dy < 3; ++dy) {
         int yy = Y + 1 - dy;
         yy = yy < 0 ? yy + H : (yy >= H ? yy - H : yy);
+        bool on[6];
+        const uint8_t *u = up + (uint64_t)yy * W;
+        if (vec) {
+            const uchar4 m = *reinterpret_cast<const uchar4 *>(u + X0);
+            on[1] = m.x; on[2] = m.y; on[3] = m.z; on[4] = m.w;
+        } else {
+#pragma unroll
+            for (int k = 0; k < 4; ++k)
+                on[k + 1] = u[(X0 + k) % W];
+        }
+        on[0] = u[X0 == 0 ? W - 1 : X0 - 1];
+        on[5] = u[X0 + 4 >= W ? X0 + 4 - W : X0 + 4];
 #pragma unroll
         for (int f = 0; f < 4; ++f) {
             if (filter_tap(f, 3 * dy) == 0.f && filter_tap(f, 3 * dy + 1) == 0.f && filter_tap(f, 3 * dy + 2) == 0.f)
                 continue;  // no taps in this row of the filter
             float v[6];
-            load_row(d + f * plane, yy, v);
+            load_row(d + f * plane, yy, on, v);
 #pragma unroll
             for (int k = 0; k < 4; ++k)
 #pragma unroll

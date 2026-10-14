@@ -237,7 +237,7 @@ std::tuple<size_t, size_t, size_t> backward_workspace(size_t C, size_t HID, bool
 
 void backward(FloatArray4D x, FloatArray4D gy, ByteArray3D alive, FloatArray3D w1, FloatArray2D b1, FloatArray3D w2,
               FloatArray4D gx, FloatArray3D dw1, FloatArray2D db1, FloatArray3D dw2,
-              ByteArray1D packed, FloatArray4D dp, FloatArray1D partial,
+              ByteArray1D packed, FloatArray4D dp, ByteArray3D updating, FloatArray1D partial,
               uint32_t batch_per_nca, uint64_t seed, float update_rate, bool fp32, bool growing, uintptr_t stream_handle)
 {
     const auto stream = reinterpret_cast<cudaStream_t>(stream_handle);
@@ -261,6 +261,7 @@ void backward(FloatArray4D x, FloatArray4D gy, ByteArray3D alive, FloatArray3D w
     validate_array_shape(dp, {chunk < N ? 2 * chunk : N, 4 * C, H, W}, "dp");
     validate_array_shape(packed, {K * packed_bytes}, "packed");
     validate_array_shape(partial, {N * partial_floats}, "partial");
+    validate_array_shape(updating, {N, H, W}, "updating");
     if (growing)
         validate_array_shape(alive, {N, H, W}, "alive");
     dispatch(C, HID, fp32, update_rate < 1.f, growing, [&](auto I) {
@@ -286,11 +287,12 @@ void backward(FloatArray4D x, FloatArray4D gy, ByteArray3D alive, FloatArray3D w
             const cudaStream_t s = split ? side_stream(i % 2) : stream;
             float *dpc = dp.data() + (i % 2) * chunk * 4 * D::C * plane;  // in-stream order protects the buffer
             kernel<<<dim3(blocks, n), nca_step::BWD_THREADS, smem, s>>>(x.data(), gy.data(), alive.data(), pk, dpc,
-                                                                       partial.data(), n0, batch_per_nca, H, W, seed, update_rate);
+                                                                       updating.data(), partial.data(), n0, batch_per_nca,
+                                                                       H, W, seed, update_rate);
             cuda_check(cudaGetLastError());
             const uint64_t total = (uint64_t)n * D::C * H * ceil_div(W, 4);  // 4 pixels per thread
             nca_step::adjoint_kernel<D::C, D::ALIVE><<<(unsigned)((total + 255) / 256), 256, 0, s>>>(
-                dpc, gy.data() + n0 * D::C * plane, alive.data() + (growing ? n0 * plane : 0),
+                dpc, updating.data() + n0 * plane, gy.data() + n0 * D::C * plane, alive.data() + (growing ? n0 * plane : 0),
                 gx.data() + n0 * D::C * plane, H, W, total);
             cuda_check(cudaGetLastError());
         }
@@ -326,9 +328,9 @@ NB_MODULE(nca_cuda, m)
     m.def("backward_workspace", &backward_workspace, "channels"_a, "hidden"_a, "fp32"_a, "N"_a, "H"_a, "W"_a, "update_rate"_a,
           "(packed weight bytes per NCA, partial floats per image, images of dp) for backward().");
     m.def("backward", &backward, "x"_a, "gy"_a, "alive"_a, "w1"_a, "b1"_a, "w2"_a, "gx"_a, "dw1"_a, "db1"_a, "dw2"_a,
-          "packed"_a, "dp"_a, "partial"_a, "batch_per_nca"_a, "seed"_a, "update_rate"_a, "fp32"_a, "growing"_a, "stream"_a,
+          "packed"_a, "dp"_a, "updating"_a, "partial"_a, "batch_per_nca"_a, "seed"_a, "update_rate"_a, "fp32"_a, "growing"_a, "stream"_a,
           "Gradients of one NCA step (same seed, update_rate and, if growing, alive mask as the forward). Writes gx, dw1, db1, dw2; packed, dp and partial "
-          "are workspaces sized by backward_workspace(): dp holds all N images (one launch) or two chunks of images. Weight gradients are reduced in a fixed order.");
+          "are workspaces sized by backward_workspace(): dp holds all N images (one launch) or two chunks of images; updating (N, H, W) marks the updating pixels (dp = 0 elsewhere, not written). Weight gradients are reduced in a fixed order.");
     m.def("update_mask", &update_mask, "mask"_a, "seed"_a, "update_rate"_a,
           "The stochastic update mask used by forward / backward: mask (N, H, W) = floor(U + update_rate).");
 }
