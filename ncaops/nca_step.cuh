@@ -27,7 +27,7 @@ namespace nca_step {
 #define NCA_TILES_PER_BLOCK 2
 #endif
 #ifndef NCA_FWD_WARPS
-#define NCA_FWD_WARPS 4
+#define NCA_FWD_WARPS 8
 #endif
 #ifndef NCA_BWD_TILES_PER_BLOCK
 #define NCA_BWD_TILES_PER_BLOCK 8
@@ -462,6 +462,13 @@ struct BwdShape {
     static constexpr int CPAD = 16 * MT2;
     static constexpr int NIW = NT1 / BWD_WARPS;              // hidden n-tiles owned by each warp
     static_assert(NT1 % BWD_WARPS == 0, "hidden n-tiles are split evenly over the warps");
+    // relu(h) and dh are staged for the weight gradients in HPARTS parts of the hidden units (less shared memory:
+    // 16 / 128 then fits two blocks per SM on sm_89). With two parts, relu(h)'s second part goes to the p buffer
+    // (p is staged later, for dW1), and each warp owns NIWP n-tiles of each part.
+    static constexpr int HPARTS = (NIW % 2 == 0 && HID / 2 <= PIN) ? 2 : 1;
+    static constexpr int HP = HID / HPARTS, NTH = NT1 / HPARTS, NIWP = NIW / HPARTS;
+    // hidden n-tile of the warp's accumulator q
+    __device__ static constexpr int owned(int warp, int q) { return (q / NIWP) * NTH + warp * NIWP + q % NIWP; }
     static constexpr int PARTIAL = HID * PIN + HID + C * HID;  // dW1, db1, dW2 per block
     static_assert(CPAD >= 8 * NT2, "channel padding");
 };
@@ -517,8 +524,8 @@ template <int C, int HID>
 struct BackwardSmem {
     using BS = BwdShape<C, HID>;
     Tile<C, BWD_TILE_H> x;
-    Staged<BWD_PIX, BS::PIN> p;          // p (K order of feature())
-    Staged<BWD_PIX, HID> h;              // relu(h), later dh
+    Staged<BWD_PIX, BS::PIN> p;          // p (K order of feature()); with two parts first relu(h) (second part)
+    Staged<BWD_PIX, BS::HP> h;           // relu(h) (first part), later dh (one part at a time)
     Staged<BWD_PIX, BS::CPAD> gm;        // g * m (channels zero-padded)
     float db1[BWD_WARPS][HID];           // per-warp sums of dh over the block's pixels
 };
@@ -570,11 +577,15 @@ __global__ void __launch_bounds__(BWD_THREADS, BWD_MIN_BLOCKS) backward_kernel(
         sm.x.load(xn, H, W, y0, x0);
         __syncthreads();
 
-        // ---- p (A fragments + shared copy in K order), h = W1 p + b1
+        // ---- p (A fragments, and the shared copy in K order unless that buffer holds relu(h) first), h = W1 p + b1
+        auto stage_p = [&](int s, int e, float v) { sm.p(16 * row + g + 8 * (e % 2), 8 * s + t + 4 * (e / 2)) = staged<FP32>(v); };
+        // staged relu(h) or dh, hidden unit c of pixel px
+        auto hbuf = [&](int px, int c) -> float & { return c < BS::HP ? sm.h(px, c) : sm.p(px, c - BS::HP); };
         Op4<FP32> a[BS::KS1];
         sm.x.template perceive_all<BS::KS1>(row, g, t, [&](int s, int e, float v) {
             a[s].set(e, v);
-            sm.p(16 * row + g + 8 * (e % 2), 8 * s + t + 4 * (e / 2)) = staged<FP32>(v);
+            if constexpr (BS::HPARTS == 1)
+                stage_p(s, e, v);
         });
         uint32_t positive[(BS::NT1 * 4 + 31) / 32] = {};
 #pragma unroll
@@ -587,7 +598,7 @@ __global__ void __launch_bounds__(BWD_THREADS, BWD_MIN_BLOCKS) backward_kernel(
             for (int e = 0; e < 4; ++e) {
                 if (h[e] > 0.f)
                     positive[(4 * j + e) / 32] |= 1u << ((4 * j + e) % 32);
-                sm.h(16 * row + g + 8 * (e / 2), 8 * j + 2 * t + e % 2) = staged<FP32>(fmaxf(h[e], 0.f));
+                hbuf(16 * row + g + 8 * (e / 2), 8 * j + 2 * t + e % 2) = staged<FP32>(fmaxf(h[e], 0.f));
             }
         }
 
@@ -663,8 +674,8 @@ __global__ void __launch_bounds__(BWD_THREADS, BWD_MIN_BLOCKS) backward_kernel(
             }
 #pragma unroll
             for (int q = 0; q < BS::NIW; ++q) {
-                const int ni = warp * BS::NIW + q;
-                const auto b = frag_from_staged<FP32>(sm.h(8 * kk + t, 8 * ni + g), sm.h(8 * kk + t + 4, 8 * ni + g));
+                const int c = 8 * BS::owned(warp, q) + g;
+                const auto b = frag_from_staged<FP32>(hbuf(8 * kk + t, c), hbuf(8 * kk + t + 4, c));
 #pragma unroll
                 for (int mi = 0; mi < BS::MT2; ++mi)
                     mma<FP32>(accg[mi][q], ag2[mi], b);
@@ -682,28 +693,33 @@ __global__ void __launch_bounds__(BWD_THREADS, BWD_MIN_BLOCKS) backward_kernel(
                 if (g == 0)
                     sm.db1[warp][8 * j + 2 * t + e] += v;
             }
-        __syncthreads();
 #pragma unroll
-        for (int j = 0; j < BS::NT1; ++j)
+        for (int part = 0; part < BS::HPARTS; ++part) {  // dh one part at a time in sm.h
+            __syncthreads();
+            if (BS::HPARTS == 2 && part == 0)  // p again (cheap), into the buffer that held relu(h)
+                sm.x.template perceive_all<BS::KS1>(row, g, t, stage_p);
 #pragma unroll
-            for (int e = 0; e < 4; ++e)
-                sm.h(16 * row + g + 8 * (e / 2), 8 * j + 2 * t + e % 2) = staged<FP32>(dh[j][e]);
-        __syncthreads();
+            for (int j = part * BS::NTH; j < (part + 1) * BS::NTH; ++j)
 #pragma unroll
-        for (int kk = 0; kk < BWD_PIX / 8; ++kk) {
-            Op4<FP32> ap[BS::MTA];
+                for (int e = 0; e < 4; ++e)
+                    sm.h(16 * row + g + 8 * (e / 2), 8 * (j - part * BS::NTH) + 2 * t + e % 2) = staged<FP32>(dh[j][e]);
+            __syncthreads();
 #pragma unroll
-            for (int mi = 0; mi < BS::MTA; ++mi)
-#pragma unroll
-                for (int e = 0; e < 4; ++e)  // feature rows (K order) 16 mi + g (+ 8)
-                    ap[mi].set_staged(e, sm.p(8 * kk + t + 4 * (e / 2), 16 * mi + 8 * (e % 2) + g));
-#pragma unroll
-            for (int q = 0; q < BS::NIW; ++q) {
-                const int ni = warp * BS::NIW + q;
-                const auto b = frag_from_staged<FP32>(sm.h(8 * kk + t, 8 * ni + g), sm.h(8 * kk + t + 4, 8 * ni + g));
+            for (int kk = 0; kk < BWD_PIX / 8; ++kk) {
+                Op4<FP32> ap[BS::MTA];
 #pragma unroll
                 for (int mi = 0; mi < BS::MTA; ++mi)
-                    mma<FP32>(accp[mi][q], ap[mi], b);
+#pragma unroll
+                    for (int e = 0; e < 4; ++e)  // feature rows (K order) 16 mi + g (+ 8)
+                        ap[mi].set_staged(e, sm.p(8 * kk + t + 4 * (e / 2), 16 * mi + 8 * (e % 2) + g));
+#pragma unroll
+                for (int q = part * BS::NIWP; q < (part + 1) * BS::NIWP; ++q) {
+                    const int c = 8 * BS::owned(warp, q) - part * BS::HP + g;
+                    const auto b = frag_from_staged<FP32>(sm.h(8 * kk + t, c), sm.h(8 * kk + t + 4, c));
+#pragma unroll
+                    for (int mi = 0; mi < BS::MTA; ++mi)
+                        mma<FP32>(accp[mi][q], ap[mi], b);
+                }
             }
         }
     }
@@ -722,7 +738,7 @@ __global__ void __launch_bounds__(BWD_THREADS, BWD_MIN_BLOCKS) backward_kernel(
     for (int q = 0; q < BS::NIW; ++q)
 #pragma unroll
         for (int e = 0; e < 4; ++e) {
-            const int hid = 8 * (warp * BS::NIW + q) + 2 * t + e % 2;
+            const int hid = 8 * BS::owned(warp, q) + 2 * t + e % 2;
 #pragma unroll
             for (int mi = 0; mi < BS::MTA; ++mi) {
                 const int f = 16 * mi + g + 8 * (e / 2);  // K position of the feature
@@ -759,36 +775,60 @@ __global__ void reduce_kernel(const float *__restrict__ partial, int blocks_per_
 }
 
 // dx = g (* a) + sum_f sum_o K_f(o) dp_{4c+f}(y - o), the transpose of the circular perception filters. One thread
-// per (pixel, channel); neighbouring taps are served by L1 (faster than shared-memory staging of all 4C planes).
+// per (4 neighbouring pixels of a row, channel): for each tap row of a dp plane it loads the 4 pixels (one float4 if
+// W % 4 == 0) and their 2 neighbours, a third of the loads of one thread per pixel. Taps are served by L1.
 template <int C, bool ALIVE>
 __global__ void __launch_bounds__(256) adjoint_kernel(const float *__restrict__ dp, const float *__restrict__ gy,
                                                       const uint8_t *__restrict__ alive, float *__restrict__ gx,
-                                                      int H, int W, uint64_t total)
+                                                      int H, int W, uint64_t total)  // total = images * C * H * W4
 {
     const uint64_t i = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x;
     if (i >= total)
         return;
-    const int X = i % W, Y = (i / W) % H;
-    const uint64_t nc = i / ((uint64_t)H * W);           // n * C + c
-    const uint64_t n = nc / C, c = nc % C;
-    const float *d = dp + (n * 4 * C + 4 * c) * (uint64_t)H * W;
-    float v = ALIVE ? (alive[n * H * W + (uint64_t)Y * W + X] ? gy[i] : 0.f) : gy[i];
+    const int W4 = (W + 3) / 4, X0 = 4 * (i % W4), Y = (i / W4) % H;
+    const uint64_t nc = i / ((uint64_t)H * W4), n = nc / C, c = nc % C, plane = (uint64_t)H * W;
+    const float *d = dp + (n * 4 * C + 4 * c) * plane;
+    const bool vec = W % 4 == 0;
+    // pixels X0 - 1 .. X0 + 4 of row yy of plane P (circular)
+    auto load_row = [&](const float *P, int yy, float (&v)[6]) {
+        P += (uint64_t)yy * W;
+        if (vec) {
+            const float4 m = __ldg(reinterpret_cast<const float4 *>(P + X0));
+            v[1] = m.x; v[2] = m.y; v[3] = m.z; v[4] = m.w;
+        } else {
+#pragma unroll
+            for (int k = 0; k < 4; ++k)
+                v[k + 1] = __ldg(P + (X0 + k) % W);
+        }
+        v[0] = __ldg(P + (X0 == 0 ? W - 1 : X0 - 1));
+        v[5] = __ldg(P + (X0 + 4) % W);
+    };
+    float out[4] = {};
 #pragma unroll
     for (int dy = 0; dy < 3; ++dy) {
         int yy = Y + 1 - dy;
         yy = yy < 0 ? yy + H : (yy >= H ? yy - H : yy);
 #pragma unroll
-        for (int dx = 0; dx < 3; ++dx) {
-            int xx = X + 1 - dx;
-            xx = xx < 0 ? xx + W : (xx >= W ? xx - W : xx);
-            const uint64_t o = (uint64_t)yy * W + xx;
+        for (int f = 0; f < 4; ++f) {
+            if (filter_tap(f, 3 * dy) == 0.f && filter_tap(f, 3 * dy + 1) == 0.f && filter_tap(f, 3 * dy + 2) == 0.f)
+                continue;  // no taps in this row of the filter
+            float v[6];
+            load_row(d + f * plane, yy, v);
 #pragma unroll
-            for (int f = 0; f < 4; ++f)
-                if (filter_tap(f, 3 * dy + dx) != 0.f)
-                    v = fmaf(filter_tap(f, 3 * dy + dx), __ldg(d + f * (uint64_t)H * W + o), v);
+            for (int k = 0; k < 4; ++k)
+#pragma unroll
+                for (int dx = 0; dx < 3; ++dx)  // tap (dy, dx) reads pixel X0 + k + 1 - dx = v[k + 2 - dx]
+                    if (filter_tap(f, 3 * dy + dx) != 0.f)
+                        out[k] = fmaf(filter_tap(f, 3 * dy + dx), v[k + 2 - dx], out[k]);
         }
     }
-    gx[i] = v;
+    const uint64_t o = nc * plane + (uint64_t)Y * W + X0;
+#pragma unroll
+    for (int k = 0; k < 4; ++k)
+        if (X0 + k < W) {
+            const float g = ALIVE ? (alive[n * plane + (uint64_t)Y * W + X0 + k] ? gy[o + k] : 0.f) : gy[o + k];
+            gx[o + k] = g + out[k];
+        }
 }
 
 }  // namespace nca_step

@@ -18,7 +18,7 @@ class _Step(torch.autograd.Function):
         n = (K * B, H, W) if growing else (0, 0, 0)
         alpha, alive = torch.empty(n, device=x.device), torch.empty(n, dtype=torch.uint8, device=x.device)
         nca_cuda.forward(x.view(K * B, C, H, W), w1, b1, w2, y.view(K * B, C, H, W), alpha, alive, B, seed, update_rate,
-                         fp32, growing)
+                         fp32, growing, torch.cuda.current_stream(x.device).cuda_stream)
         ctx.save_for_backward(x, w1, b1, w2, alive)
         ctx.update_rate, ctx.seed, ctx.fp32, ctx.growing = update_rate, seed, fp32, growing
         return y
@@ -30,15 +30,16 @@ class _Step(torch.autograd.Function):
         packed_bytes, partial_floats, chunk = nca_cuda.backward_workspace(C, w1.shape[1], ctx.fp32, K * B, H, W)
         packed = torch.empty(K * packed_bytes, dtype=torch.uint8, device=x.device)
         partial = torch.empty(K * B * partial_floats, device=x.device)
-        dp = torch.empty(CHUNK or chunk, 4 * C, H, W, device=x.device)
+        chunk = CHUNK or chunk
+        dp = torch.empty(K * B if chunk >= K * B else 2 * chunk, 4 * C, H, W, device=x.device)  # all, or 2 chunks
         gx, dw1, db1, dw2 = torch.empty_like(x), torch.empty_like(w1), torch.empty_like(b1), torch.empty_like(w2)
         nca_cuda.backward(x.view(K * B, C, H, W), gy.contiguous().view(K * B, C, H, W), alive, w1, b1, w2,
                           gx.view(K * B, C, H, W), dw1, db1, dw2, packed, dp, partial, B, ctx.seed, ctx.update_rate,
-                          ctx.fp32, ctx.growing)
+                          ctx.fp32, ctx.growing, torch.cuda.current_stream(x.device).cuda_stream)
         return gx, dw1, db1, dw2, None, None, None, None
 
 
-CHUNK = None  # images per backward launch (None: as many as keep dp in half of the L2 cache)
+CHUNK = None  # images per backward chunk (None: two chunks keep their dp within half of the L2 cache)
 
 
 def new_seed():

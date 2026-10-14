@@ -74,7 +74,7 @@ def test():
                     for fp32 in (True, False):
                         out = grads(lambda *p: nca_ops.step(*p, rate, growing, fp32=fp32, seed=99))
                         bwd[fp32] = max([bwd[fp32]] + [rel(a, b) for a, b in zip(out, ref)])
-                    nca_ops.CHUNK = 4  # the backward in several launches
+                    nca_ops.CHUNK = 2  # the backward in chunks on two streams
                     det &= all(torch.equal(a, b) for a, b in zip(out, grads(lambda *p: nca_ops.step(*p, rate, growing, seed=99))))
                     nca_ops.CHUNK = None
                     det &= all(torch.equal(a, b) for a, b in zip(out, grads(lambda *p: nca_ops.step(*p, rate, growing, seed=99))))
