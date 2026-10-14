@@ -71,6 +71,9 @@ constexpr int conflict_free_stride(int n)
     return (n % 32 == 8 || n % 32 == 24) ? n : conflict_free_stride(n + 1);
 }
 
+// i wrapped into 0 .. n - 1 for i in -n .. 2n - 1 (circular padding)
+__device__ __forceinline__ int wrap(int i, int n) { return i < 0 ? i + n : (i >= n ? i - n : i); }
+
 // K order of the perception features in the p -> h MMA: in k-steps (2q, 2q + 1), lane t computes all four filters of
 // channel 4q + t (its 3 x 3 neighbourhood is loaded once). Column k of k-step s is channel 4 (s / 2) + k % 4, filter
 // 2 (s % 2) + k / 4, i.e. feature 4 c + f of W1.
@@ -231,31 +234,41 @@ struct Tile {
     __device__ __forceinline__ float at(int c, int row, int col) const { return v[c][row * HALO_W + col]; }
 
     // The tile at (y0, x0) of an image (CH channel planes of H x W) with circular wrap, loaded by THREADS threads in
-    // two steps (other work overlaps the loads): fetch() into registers, store() into the tile.
-    static constexpr int ELEMS = CH * (TH + 2) * HALO_W;
+    // two steps (other work overlaps the loads): fetch() into registers, store() into the tile. Thread i holds halo
+    // pixel (i / 16, i % 16) in every channel, and elements i, i + THREADS, ... of the last two halo columns.
+    static constexpr int ROWS = TH + 2, EXTRA = CH * ROWS * 2;
     template <int THREADS>
-    using Regs = float[(ELEMS + THREADS - 1) / THREADS];
+    using Regs = float[CH + (EXTRA + THREADS - 1) / THREADS];
     template <int THREADS>
     __device__ __forceinline__ void fetch(Regs<THREADS> &r, const float *__restrict__ x, int H, int W, int y0, int x0) const
     {
+        const int i = threadIdx.x;
+        if (i < ROWS * TILE_W) {
+            const float *p = x + (size_t)wrap(y0 - 1 + i / TILE_W, H) * W + wrap(x0 - 1 + i % TILE_W, W);
 #pragma unroll
-        for (int k = 0; k < (ELEMS + THREADS - 1) / THREADS; ++k) {
-            const int i = threadIdx.x + k * THREADS, col = i % HALO_W, row = (i / HALO_W) % (TH + 2), c = i / (HALO_W * (TH + 2));
-            int gy = y0 - 1 + row, gx = x0 - 1 + col;
-            gy = gy < 0 ? gy + H : (gy >= H ? gy - H : gy);
-            gx = gx < 0 ? gx + W : (gx >= W ? gx - W : gx);
-            if (i < ELEMS)
-                r[k] = __ldcg(x + ((size_t)c * H + gy) * W + gx);
+            for (int c = 0; c < CH; ++c)
+                r[c] = __ldcg(p + (size_t)c * H * W);
+        }
+#pragma unroll
+        for (int k = 0; k < (EXTRA + THREADS - 1) / THREADS; ++k) {
+            const int e = i + k * THREADS, c = e / (2 * ROWS), row = e / 2 % ROWS, col = TILE_W + e % 2;
+            if (e < EXTRA)
+                r[CH + k] = __ldcg(x + ((size_t)c * H + wrap(y0 - 1 + row, H)) * W + wrap(x0 - 1 + col, W));
         }
     }
     template <int THREADS>
     __device__ __forceinline__ void store(const Regs<THREADS> &r)
     {
+        const int i = threadIdx.x;
+        if (i < ROWS * TILE_W)
 #pragma unroll
-        for (int k = 0; k < (ELEMS + THREADS - 1) / THREADS; ++k) {
-            const int i = threadIdx.x + k * THREADS, col = i % HALO_W, row = (i / HALO_W) % (TH + 2), c = i / (HALO_W * (TH + 2));
-            if (i < ELEMS)
-                at(c, row, col) = r[k];
+            for (int c = 0; c < CH; ++c)
+                at(c, i / TILE_W, i % TILE_W) = r[c];
+#pragma unroll
+        for (int k = 0; k < (EXTRA + THREADS - 1) / THREADS; ++k) {
+            const int e = i + k * THREADS;
+            if (e < EXTRA)
+                at(e / (2 * ROWS), e / 2 % ROWS, TILE_W + e % 2) = r[CH + k];
         }
     }
 
@@ -642,9 +655,10 @@ __global__ void alive_kernel(const float *__restrict__ x, const float *__restric
 // Main kernel, on the updating pixels of a block tile (m = 1 and, if growing, alive after the step; the others have
 // dp = 0: dp is not written there, the kernel marks them in an updating map) in rounds of 16 pixels per warp (the MMA
 // rows): recompute p and h = W1 p + b1, stage p, relu(h) and g*m in shared memory, then
-//   dh = (g * m) W2 * [h > 0]          (MMA, registers); db1 += sum of dh over the pixels (warp shuffles)
+//   dh = (g * m) W2 * [h > 0]          (MMA, registers)
 //   dp = dh W1                          (MMA, permuted hidden index as in the forward) -> global (N, H, W, 4C)
 //   dW2 += (g * m)^T relu(h),  dW1 += dh^T p   (MMA over the pixels of the tile, per-block accumulators)
+//   db1 += column sums of the staged dh
 // Each block writes its weight-gradient partials; reduce_kernel sums them per NCA in a fixed order (deterministic).
 // adjoint_kernel then forms dx = g + sum_f K_f^T * dp_f (transpose of the circular 3x3 filters).
 constexpr int BWD_WARPS = 4, BWD_THREADS = 32 * BWD_WARPS;
@@ -673,7 +687,7 @@ struct BwdShape {
     // shared memory of BackwardSmem (largest tile) when relu(h) and dh are staged in `parts` parts
     __host__ __device__ static constexpr size_t smem(int parts)
     {
-        return sizeof(Tile<C, bwd_tile_h(true)>) + 4 * (BWD_PIX * (PIN + HID / parts + CPAD) + BWD_WARPS * HID) + TILE_W * bwd_tile_h(true);
+        return sizeof(Tile<C, bwd_tile_h(true)>) + 4 * BWD_PIX * (PIN + HID / parts + CPAD) + TILE_W * bwd_tile_h(true);
     }
     // relu(h) and dh are staged for the weight gradients in HPARTS parts of the hidden units when all of them do not
     // fit BWD_MIN_BLOCKS blocks per SM (16 / 128 on sm_89). With two parts, relu(h)'s second part goes to the p buffer
@@ -684,6 +698,7 @@ struct BwdShape {
     __device__ static constexpr int owned(int warp, int q) { return (q / NIWP) * NTH + warp * NIWP + q % NIWP; }
     static constexpr int PARTIAL = HID * PIN + HID + C * HID;  // dW1, db1, dW2 per block
     static_assert(CPAD >= 8 * NT2, "channel padding");
+    static_assert(HP <= BWD_THREADS && (HPARTS == 1 || NTH <= 8), "db1: one thread per hidden unit of a part; second-part mask bits");
 };
 
 // Two B fragments of consecutive k-steps / n-tiles (one 16-byte load per lane).
@@ -753,7 +768,6 @@ struct BackwardSmem {
     Staged<BWD_PIX, BS::PIN> p;          // p (K order of feature()); with two parts first relu(h) (second part)
     Staged<BWD_PIX, BS::HP> h;           // relu(h) (first part), later dh (one part at a time)
     Staged<BWD_PIX, BS::CPAD> gm;        // g * m (channels zero-padded)
-    float db1[BWD_WARPS][HID];           // per-warp sums of dh over the block's pixels
     uint8_t pixels[TILE_W * bwd_tile_h(true)];  // the updating pixels of a tile (16 row + column), in order
 };
 
@@ -785,8 +799,7 @@ __global__ void __launch_bounds__(BWD_THREADS, BWD_MIN_BLOCKS) backward_kernel(
 
     float accp[BS::MTA][BS::NIW][4] = {};   // p^T dh        -> dW1^T, hidden n-tiles of this warp
     float accg[BS::MT2][BS::NIW][4] = {};   // gm^T relu(h)  -> dW2
-    for (int i = lane; i < HID; i += 32)
-        sm.db1[warp][i] = 0.f;
+    float accb[BS::HPARTS] = {};            // sum of dh     -> db1, hidden unit threadIdx.x of each part
     for (int tile = blockIdx.x * BWD_TILES_PER_BLOCK; tile < min(tiles, (blockIdx.x + 1) * BWD_TILES_PER_BLOCK); ++tile) {
         const int y0 = (tile / tiles_x) * TH, x0 = (tile % tiles_x) * TILE_W;
         typename Tile<C, TH>::template Regs<BWD_THREADS> xr;
@@ -823,6 +836,7 @@ __global__ void __launch_bounds__(BWD_THREADS, BWD_MIN_BLOCKS) backward_kernel(
 
         for (int first = 0; first < count; first += BWD_PIX) {  // rounds of up to 4 groups of 16 pixels
             const int groups = min(BWD_WARPS, (count - first + 15) / 16);  // block-uniform
+            const int ksteps = min(BWD_PIX / 8, (count - first + 7) / 8);   // occupied k-steps (8 pixels) of the weight gradients
             const bool busy = warp < groups;
             // fragment rows g, g + 8 of this warp: tile pixels pr / pc (the last pixel repeated past the count, with g * m = 0)
             int pr[2], pc[2];
@@ -836,8 +850,7 @@ __global__ void __launch_bounds__(BWD_THREADS, BWD_MIN_BLOCKS) backward_kernel(
             // staged relu(h) or dh, hidden unit c of round slot px
             auto hbuf = [&](int px, int c) -> float & { return c < BS::HP ? sm.h(px, c) : sm.p(px, c - BS::HP); };
             Op4<FP32> ag[BS::NT2];  // g * m (* a) = g at the updating pixels: A fragments of dh = gm W2
-            uint64_t positive = 0;  // bit 4 j + e: h > 0 (accumulator element e of hidden n-tile j)
-            static_assert(BS::NT1 <= 16, "positive bits");
+            uint32_t positive = 0;  // two parts: bit 4 (j - NTH) + e: h > 0 for element e of hidden n-tile j of the second part
             if (busy) {
                 // ---- p (A fragments, and the shared copy in K order unless that buffer holds relu(h) first), h = W1 p + b1
                 Op4<FP32> a[BS::KS1];
@@ -856,11 +869,8 @@ __global__ void __launch_bounds__(BWD_THREADS, BWD_MIN_BLOCKS) backward_kernel(
                         mma<FP32>(h, a[s + 1], b[1]);
                     }
 #pragma unroll
-                    for (int e = 0; e < 4; ++e) {
-                        if (h[e] > 0.f)
-                            positive |= 1ull << (4 * j + e);
+                    for (int e = 0; e < 4; ++e)
                         hbuf(16 * warp + g + 8 * (e / 2), 8 * j + 2 * t + e % 2) = staged<FP32>(fmaxf(h[e], 0.f));
-                    }
                 }
                 // ---- g * m (A fragments, shared copy for dW2)
 #pragma unroll
@@ -875,25 +885,21 @@ __global__ void __launch_bounds__(BWD_THREADS, BWD_MIN_BLOCKS) backward_kernel(
                 for (int i = lane; i < 16 * (BS::CPAD - 8 * BS::NT2); i += 32)
                     sm.gm(16 * warp + i % 16, 8 * BS::NT2 + i / 16) = 0.f;
             }
-            // dh of hidden n-tile j = gm W2 * [h > 0] (cheap: K = C)
+            // gm W2 for hidden n-tile j (cheap: K = C); dh is that times [h > 0]
             auto dh_tile = [&](int j, float (&dh)[4]) {
                 dh[0] = dh[1] = dh[2] = dh[3] = 0.f;
 #pragma unroll
                 for (int q = 0; q < BS::NT2; ++q)
                     mma<FP32>(dh, ag[q], wk.w2d[j][q / 2][lane][q % 2]);
-#pragma unroll
-                for (int e = 0; e < 4; ++e)
-                    if (!((positive >> (4 * j + e)) & 1u))
-                        dh[e] = 0.f;
             };
 
-            // ---- dW2 += gm^T relu(h) over the round's pixels (k-steps of the busy warps' slots). Each warp owns NIW
+            // ---- dW2 += gm^T relu(h) over the round's pixels (occupied k-steps only). Each warp owns NIW
             //      hidden n-tiles, so one B fragment serves all m-tiles and the A fragments are shared by its n-tiles.
             __syncthreads();
             if (!(NCA_ABLATE & 1))
 #pragma unroll
                 for (int kk = 0; kk < BWD_PIX / 8; ++kk) {
-                    if (kk >= 2 * groups)
+                    if (kk >= ksteps)
                         break;
                     Op4<FP32> ag2[BS::MT2];
 #pragma unroll
@@ -912,9 +918,9 @@ __global__ void __launch_bounds__(BWD_THREADS, BWD_MIN_BLOCKS) backward_kernel(
                 }
             __syncthreads();  // relu(h) and its buffers are free
 
-            // ---- per hidden n-tile j: dh (registers) -> db1 (sum over the warp's 16 pixels by shuffles, fixed order:
-            //      deterministic), dp += dh W1 (MMA, permuted hidden index as in the forward), dh staged for dW1
-            //      (with two parts: the first part; the second is recomputed later). Then p (again) for dW1.
+            // ---- per hidden n-tile j: dh (registers; [h > 0] read from this lane's staged relu(h)), dp += dh W1
+            //      (MMA, permuted hidden index as in the forward), dh staged for dW1 and db1 (with two parts: the
+            //      first part; the second is recomputed later). Then p (again) for dW1.
             if (busy) {
                 float d[BS::NTP][4] = {};
 #pragma unroll (BWD_UNROLL)
@@ -922,13 +928,12 @@ __global__ void __launch_bounds__(BWD_THREADS, BWD_MIN_BLOCKS) backward_kernel(
                     float dh[4];
                     dh_tile(j, dh);
 #pragma unroll
-                    for (int e = 0; e < 2; ++e) {
-                        float v = dh[e] + dh[e + 2];
-                        v += __shfl_xor_sync(~0u, v, 4);
-                        v += __shfl_xor_sync(~0u, v, 8);
-                        v += __shfl_xor_sync(~0u, v, 16);
-                        if (g == 0)
-                            sm.db1[warp][8 * j + 2 * t + e] += v;
+                    for (int e = 0; e < 4; ++e) {
+                        const bool pos = hbuf(16 * warp + g + 8 * (e / 2), 8 * j + 2 * t + e % 2) > 0.f;
+                        if (BS::HPARTS == 2 && j >= BS::NTH)
+                            positive |= (uint32_t)pos << (4 * (j - BS::NTH) + e);
+                        if (!pos)
+                            dh[e] = 0.f;
                     }
                     Op4<FP32> ad;
                     ad.set(0, dh[0]); ad.set(1, dh[2]); ad.set(2, dh[1]); ad.set(3, dh[3]);
@@ -966,16 +971,31 @@ __global__ void __launch_bounds__(BWD_THREADS, BWD_MIN_BLOCKS) backward_kernel(
                             float dh[4];
                             dh_tile(j, dh);
 #pragma unroll
-                            for (int e = 0; e < 4; ++e)
+                            for (int e = 0; e < 4; ++e) {
+                                if (!((positive >> (4 * (j - BS::NTH) + e)) & 1u))
+                                    dh[e] = 0.f;
                                 sm.h(16 * warp + g + 8 * (e / 2), 8 * (j - part * BS::NTH) + 2 * t + e % 2) = staged<FP32>(dh[e]);
+                            }
                         }
                 }
                 __syncthreads();
                 if (NCA_ABLATE & 1)
                     continue;
+                if (threadIdx.x < BS::HP) {  // db1: column sums of the staged dh, in a fixed order (deterministic)
+                    float s[4] = {};
+#pragma unroll
+                    for (int kk = 0; kk < BWD_PIX / 8; ++kk) {
+                        if (kk >= ksteps)
+                            break;
+#pragma unroll
+                        for (int r = 0; r < 8; ++r)
+                            s[r % 4] += sm.h(8 * kk + r, threadIdx.x);
+                    }
+                    accb[part] += (s[0] + s[1]) + (s[2] + s[3]);
+                }
 #pragma unroll
                 for (int kk = 0; kk < BWD_PIX / 8; ++kk) {
-                    if (kk >= 2 * groups)
+                    if (kk >= ksteps)
                         break;
                     Op4<FP32> ap[BS::MTA];
 #pragma unroll
@@ -1000,14 +1020,10 @@ __global__ void __launch_bounds__(BWD_THREADS, BWD_MIN_BLOCKS) backward_kernel(
 
     // ---- write this block's partial weight gradients: dW1 (HID x PIN), db1 (HID), dW2 (C x HID)
     float *out = partial + ((size_t)n * gridDim.x + blockIdx.x) * BS::PARTIAL;
-    __syncthreads();
-    for (int i = threadIdx.x; i < HID; i += blockDim.x) {
-        float v = 0.f;
+    if (threadIdx.x < BS::HP)
 #pragma unroll
-        for (int w = 0; w < BWD_WARPS; ++w)
-            v += sm.db1[w][i];
-        out[HID * BS::PIN + i] = v;
-    }
+        for (int part = 0; part < BS::HPARTS; ++part)
+            out[HID * BS::PIN + part * BS::HP + threadIdx.x] = accb[part];
 #pragma unroll
     for (int q = 0; q < BS::NIW; ++q)
 #pragma unroll
