@@ -102,11 +102,6 @@ class Growing:
         return torch.cat([1 - t[3:4] + t[:3] for t in (target, x.clamp(0, 1))], 2)
 
 
-def rollout(w1, b1, w2, task, steps, step_fn):  # one sample per NCA from the seed
-    x = task.seed(w1.shape[0], 1)
-    for _ in range(steps):
-        x = step_fn(x, w1, b1, w2)
-    return x[:, 0]
 
 
 def init_weights(init, names, cfg):
@@ -167,6 +162,22 @@ def make_step(cfg):
     return lambda x, w1, b1, w2: fn(x, w1, b1, w2, rate, growing)
 
 
+def make_rollout(cfg):
+    """rollout_fn(x, w1, b1, w2, steps) without gradients: one call for impl cuda, a loop of steps otherwise."""
+    if cfg['train']['impl'] == 'cuda':
+        from ncaops import nca_ops
+        rate, growing, fp32 = cfg['nca']['update_rate'], cfg['task'] == 'growing', not cfg['train']['tf32']
+        return lambda x, w1, b1, w2, steps: nca_ops.rollout(x, w1, b1, w2, rate, steps, growing, fp32=fp32)
+    step_fn = make_step(cfg)
+
+    @torch.no_grad()
+    def rollout_fn(x, w1, b1, w2, steps):
+        for _ in range(steps):
+            x = step_fn(x, w1, b1, w2)
+        return x
+    return rollout_fn
+
+
 def main():
     cfg_path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.yml')
     cfg = yaml.safe_load(open(cfg_path))
@@ -184,7 +195,7 @@ def main():
     log_path = os.path.join(out, 'log.json')
     log = json.load(open(log_path)) if os.path.exists(log_path) else {}
     task = {'texture': Texture, 'growing': Growing}[cfg['task']](cfg)
-    step_fn = make_step(cfg)
+    step_fn, rollout_fn = make_step(cfg), make_rollout(cfg)
     G, C, Hd = cfg['train']['group_size'], cfg['nca']['channels'], cfg['nca']['hidden']
     print(f'{len(files)} targets, {len(todo)} to train, groups of {G}', flush=True)
     for g0 in range(0, len(todo), G):
@@ -192,8 +203,7 @@ def main():
         targets = torch.stack([task.load(files[i]) for i in grp]).to(dev)
         w1, b1, w2, losses, warmup, sec = train_group(targets, init_weights(path(cfg['init']), [names[i] for i in grp], cfg),
                                                       cfg, task, step_fn)
-        with torch.no_grad():
-            final = rollout(w1, b1, w2, task, cfg['preview_steps'], step_fn)
+        final = rollout_fn(task.seed(len(grp), 1), w1, b1, w2, cfg['preview_steps'])[:, 0]  # from the seed
         for k, i in enumerate(grp):
             stem = os.path.splitext(names[i])[0]
             torch.save({'w1.weight': w1[k].reshape(Hd, 4 * C, 1, 1).cpu(), 'w1.bias': b1[k].cpu(),

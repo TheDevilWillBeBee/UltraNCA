@@ -83,6 +83,15 @@ def test():
                 print(f'{C:2d}/{HID:3d} rate={rate} {"growing" if growing else "texture"}: fp32 fwd {fwd[True]:.1e} grad '
                       f'{bwd[True]:.1e} | tf32 fwd {fwd[False]:.1e} grad {bwd[False]:.1e} | deterministic {det} | '
                       f'{"ok" if passed else "FAILED"}', flush=True)
+    for growing in (False, True):  # rollout = repeated steps (every cell updating: no dependence on the seeds)
+        x, w1, b1, w2 = make(2, 2, 16, 128, 40, 48, growing=growing)
+        for steps in (0, 1, 2, 5):
+            ref = x
+            for _ in range(steps):
+                ref = nca_ops.step(ref, w1, b1, w2, 1.0, growing)
+            same = torch.equal(nca_ops.rollout(x, w1, b1, w2, 1.0, steps, growing), ref)
+            ok &= same
+            print(f'rollout {steps} steps {"growing" if growing else "texture"}: {"ok" if same else "FAILED"}')
     m = nca_ops.update_mask(4, 128, 128, 7, 0.5)
     print(f'mask: mean {m.mean().item():.4f} (expect 0.5), values {sorted(m.unique().tolist())}')
     print('all passed' if ok else 'SOME CASES FAILED')

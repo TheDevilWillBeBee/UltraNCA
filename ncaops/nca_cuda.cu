@@ -84,11 +84,41 @@ void set_smem(Kernel kernel, int bytes)
 
 static int ceil_div(int a, int b) { return (a + b - 1) / b; }
 
-void forward(FloatArray4D x, FloatArray3D w1, FloatArray2D b1, FloatArray3D w2, FloatArray4D y,
-             FloatArray3D alpha, ByteArray3D alive, uint32_t batch_per_nca, uint64_t seed, float update_rate, bool fp32,
-             bool growing, uintptr_t stream_handle)
+static int sm_count()
 {
-    const auto stream = reinterpret_cast<cudaStream_t>(stream_handle);
+    static int n = [] { int dev, v; cudaGetDevice(&dev); cudaDeviceGetAttribute(&v, cudaDevAttrMultiProcessorCount, dev); return v; }();
+    return n;
+}
+
+// One step x -> y (N images of C x H x W, K = N / B NCAs) on `stream`; growing: alpha workspace and alive mask (N, H, W).
+static void launch_forward(const float *x, const float *w1, const float *b1, const float *w2, float *y, float *alpha,
+                           uint8_t *alive, size_t N, size_t C, size_t HID, size_t H, size_t W, uint32_t B, uint64_t seed,
+                           float update_rate, bool fp32, bool growing, cudaStream_t stream)
+{
+    dispatch(C, HID, fp32, update_rate < 1.f, growing, [&](auto I) {
+        using D = decltype(I);
+        auto kernel = nca_step::forward_kernel<D::C, D::HID, D::FP32, D::STOCH, D::ALIVE>;
+        constexpr int smem = sizeof(nca_step::ForwardSmem<D::C, D::HID, D::FP32>);
+        static bool init = (set_smem(kernel, smem), true);
+        (void)init;
+        const int tiles = ceil_div(W, nca_step::TILE_W) * ceil_div(H, nca_step::TILE_H);
+        // several tiles per block amortise the weight staging, unless that leaves SMs idle (small grids)
+        const int tpb = N * tiles >= 2 * nca_step::TILES_PER_BLOCK * sm_count() ? nca_step::TILES_PER_BLOCK : 1;
+        kernel<<<dim3(ceil_div(tiles, tpb), N), nca_step::FWD_THREADS, smem, stream>>>(
+            x, w1, b1, w2, y, alpha, B, H, W, seed, update_rate, tpb);
+        cuda_check(cudaGetLastError());
+        if constexpr (D::ALIVE)
+        {
+            const uint64_t total = (uint64_t)N * H * W;
+            nca_step::alive_kernel<D::C><<<(unsigned)((total + 255) / 256), 256, 0, stream>>>(x, alpha, y, alive, H, W, total);
+            cuda_check(cudaGetLastError());
+        }
+    });
+}
+
+static void validate_forward(FloatArray4D x, FloatArray3D w1, FloatArray2D b1, FloatArray3D w2, FloatArray4D y,
+                             FloatArray3D alpha, ByteArray3D alive, uint32_t batch_per_nca, bool growing)
+{
     const size_t N = x.shape(0), C = x.shape(1), H = x.shape(2), W = x.shape(3), K = w1.shape(0), HID = w1.shape(1);
     if (N != K * batch_per_nca)
         throw std::runtime_error("x.shape[0] must equal (number of NCAs) * batch_per_nca");
@@ -103,23 +133,47 @@ void forward(FloatArray4D x, FloatArray3D w1, FloatArray2D b1, FloatArray3D w2, 
         validate_array_shape(alpha, {N, H, W}, "alpha");
         validate_array_shape(alive, {N, H, W}, "alive");
     }
-    dispatch(C, HID, fp32, update_rate < 1.f, growing, [&](auto I) {
-        using D = decltype(I);
-        auto kernel = nca_step::forward_kernel<D::C, D::HID, D::FP32, D::STOCH, D::ALIVE>;
-        constexpr int smem = sizeof(nca_step::ForwardSmem<D::C, D::HID, D::FP32>);
-        set_smem(kernel, smem);
-        const int tiles = ceil_div(W, nca_step::TILE_W) * ceil_div(H, nca_step::TILE_H);
-        kernel<<<dim3(ceil_div(tiles, nca_step::TILES_PER_BLOCK), N), nca_step::FWD_THREADS, smem, stream>>>(
-            x.data(), w1.data(), b1.data(), w2.data(), y.data(), alpha.data(), batch_per_nca, H, W, seed, update_rate);
-        cuda_check(cudaGetLastError());
-        if constexpr (D::ALIVE)
-        {
-            const uint64_t total = (uint64_t)N * H * W;
-            nca_step::alive_kernel<D::C><<<(unsigned)((total + 255) / 256), 256, 0, stream>>>(
-                x.data(), alpha.data(), y.data(), alive.data(), H, W, total);
-            cuda_check(cudaGetLastError());
-        }
-    });
+}
+
+void forward(FloatArray4D x, FloatArray3D w1, FloatArray2D b1, FloatArray3D w2, FloatArray4D y,
+             FloatArray3D alpha, ByteArray3D alive, uint32_t batch_per_nca, uint64_t seed, float update_rate, bool fp32,
+             bool growing, uintptr_t stream)
+{
+    validate_forward(x, w1, b1, w2, y, alpha, alive, batch_per_nca, growing);
+    launch_forward(x.data(), w1.data(), b1.data(), w2.data(), y.data(), alpha.data(), alive.data(), x.shape(0), x.shape(1),
+                   w1.shape(1), x.shape(2), x.shape(3), batch_per_nca, seed, update_rate, fp32, growing,
+                   reinterpret_cast<cudaStream_t>(stream));
+}
+
+// splitmix64: the seed of step i of a rollout
+static uint64_t step_seed(uint64_t seed, uint64_t i)
+{
+    uint64_t z = seed + (i + 1) * 0x9E3779B97F4A7C15ull;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
+}
+
+// `steps` steps from x, ping-ponging between y and tmp so that the result ends in y (x is not modified).
+void rollout(FloatArray4D x, FloatArray3D w1, FloatArray2D b1, FloatArray3D w2, FloatArray4D y, FloatArray4D tmp,
+             FloatArray3D alpha, ByteArray3D alive, uint32_t steps, uint32_t batch_per_nca, uint64_t seed,
+             float update_rate, bool fp32, bool growing, uintptr_t stream_handle)
+{
+    validate_forward(x, w1, b1, w2, y, alpha, alive, batch_per_nca, growing);
+    if (steps > 1)
+        validate_array_shape(tmp, {x.shape(0), x.shape(1), x.shape(2), x.shape(3)}, "tmp");
+    const auto stream = reinterpret_cast<cudaStream_t>(stream_handle);
+    if (steps == 0)
+        cuda_check(cudaMemcpyAsync(y.data(), x.data(), x.size() * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+    const float *src = x.data();
+    for (uint32_t i = 0; i < steps; ++i)
+    {
+        float *dst = (steps - i) % 2 ? y.data() : tmp.data();
+        launch_forward(src, w1.data(), b1.data(), w2.data(), dst, alpha.data(), alive.data(), x.shape(0), x.shape(1),
+                       w1.shape(1), x.shape(2), x.shape(3), batch_per_nca, step_seed(seed, i), update_rate, fp32,
+                       growing, stream);
+        src = dst;
+    }
 }
 
 static int backward_blocks_per_image(int H, int W)
@@ -261,6 +315,10 @@ NB_MODULE(nca_cuda, m)
           "w2: (K, C, hidden). fp32=False uses TF32 tensor cores, fp32=True 3xTF32 (fp32 accuracy). update_rate >= 1: "
           "every cell updates. growing: alive masking (alpha = channel 3); alpha (N, H, W) is a workspace and alive "
           "(N, H, W) receives the mask for backward() (both unused otherwise).");
+    m.def("rollout", &rollout, "x"_a, "w1"_a, "b1"_a, "w2"_a, "y"_a, "tmp"_a, "alpha"_a, "alive"_a, "steps"_a,
+          "batch_per_nca"_a, "seed"_a, "update_rate"_a, "fp32"_a, "growing"_a, "stream"_a,
+          "`steps` forward steps from x into y (tmp: workspace like x if steps > 1), with the step seeds derived from "
+          "`seed`; no gradients.");
     m.def("backward_workspace", &backward_workspace, "channels"_a, "hidden"_a, "fp32"_a, "N"_a, "H"_a, "W"_a,
           "(packed weight bytes per NCA, partial floats per image, images of dp) for backward().");
     m.def("backward", &backward, "x"_a, "gy"_a, "alive"_a, "w1"_a, "b1"_a, "w2"_a, "gx"_a, "dw1"_a, "db1"_a, "dw2"_a,

@@ -38,7 +38,8 @@ namespace nca_step {
 constexpr int TILE_W = 16;                            // pixels per warp row = MMA M; must stay 16
 constexpr int TILE_H = NCA_TILE_H;                    // rows per forward block tile
 constexpr int FWD_WARPS = NCA_FWD_WARPS;              // forward: each warp takes TILE_H / FWD_WARPS rows of a tile
-constexpr int TILES_PER_BLOCK = NCA_TILES_PER_BLOCK;  // tiles of one image per block (amortises the weight staging)
+constexpr int TILES_PER_BLOCK = NCA_TILES_PER_BLOCK;  // tiles of one image per block (amortises the weight staging);
+                                                      // fewer when there are too few blocks (forward_kernel argument)
 constexpr int FWD_THREADS = 32 * FWD_WARPS;
 static_assert(TILE_W == 16, "A warp's 16 pixels are the MMA M dimension");
 static_assert(TILE_H % FWD_WARPS == 0, "Rows of a tile are split evenly over the warps");
@@ -315,7 +316,8 @@ __device__ bool near_alive(const float *__restrict__ alpha, int H, int W, int y0
 template <int C, int HID, bool FP32, bool STOCH, bool ALIVE>
 __global__ void __launch_bounds__(FWD_THREADS) forward_kernel(
     const float *__restrict__ x, const float *__restrict__ w1, const float *__restrict__ b1, const float *__restrict__ w2,
-    float *__restrict__ y, float *__restrict__ alpha, int B, int H, int W, uint64_t seed, float update_rate)
+    float *__restrict__ y, float *__restrict__ alpha, int B, int H, int W, uint64_t seed, float update_rate,
+    int tiles_per_block)
 {
     using S = Shape<C, HID>;
     extern __shared__ __align__(16) unsigned char smem_raw[];
@@ -328,7 +330,7 @@ __global__ void __launch_bounds__(FWD_THREADS) forward_kernel(
     float *yn = y + (size_t)n * C * H * W;
 
     bool weights_staged = false;
-    for (int tile = blockIdx.x * TILES_PER_BLOCK; tile < min(tiles, (blockIdx.x + 1) * TILES_PER_BLOCK); ++tile) {
+    for (int tile = blockIdx.x * tiles_per_block; tile < min(tiles, (blockIdx.x + 1) * tiles_per_block); ++tile) {
         const int y0 = (tile / tiles_x) * TILE_H, x0 = (tile % tiles_x) * TILE_W;
         if (ALIVE && !near_alive<TILE_H>(xn + 3 * (size_t)H * W, H, W, y0, x0))
             continue;

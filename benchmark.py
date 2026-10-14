@@ -4,7 +4,7 @@
          growing (config_growing.yml: 16 / 128, same schedule, L2 loss). Growing weights and states: trained NCAs from
          --growing_weights (runs/emoji, as written by train.py) if present, else random (no growth: unrepresentative
          alive areas).
-  infer: forward-only rollouts (no grad) of 256 steps: K NCAs x 1 sample at 64^2 and 128^2, then one NCA at several
+  infer: forward-only rollouts (no grad, train.make_rollout) of 256 steps: K NCAs x 1 sample at 64^2 and 128^2, then one NCA at several
          grid sizes; texture (12 / 96, stochastic) and growing (16 / 128) NCAs.
 python benchmark.py [train] [infer] [--impl cuda eager] [--K 32 64]
 """
@@ -90,7 +90,7 @@ def bench_train(task_name, impl, K):
 
 def bench_infer(task_name, impl, K, size, steps=256):
     cfg = config(task_name, impl)
-    step = T.make_step(cfg)
+    rollout = T.make_rollout(cfg)
     trained = os.path.join(here, a.growing_weights) if task_name == 'growing' else None
     w1, b1, w2 = weights(cfg, K, trained)
     if task_name == 'growing':  # from the single-cell seed
@@ -100,13 +100,7 @@ def bench_infer(task_name, impl, K, size, steps=256):
     else:
         x0 = 0.1 * torch.randn(K, 1, cfg['nca']['channels'], size, size, device=T.dev)
 
-    @torch.no_grad()
-    def run():
-        x = x0
-        for _ in range(steps):
-            x = step(x, w1, b1, w2)
-
-    ms = timed(run, 1, 3)
+    ms = timed(lambda: rollout(x0, w1, b1, w2, steps), 1, 3)
     print(f'infer {task_name:8s} {impl:6s} K={K:3d} {size:4d}^2 {steps} steps: {ms:8.2f} ms, '
           f'{1e6 * ms / (steps * K * size * size):6.2f} ns per cell-step', flush=True)
 

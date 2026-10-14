@@ -10,15 +10,20 @@ except ImportError:
     import nca_cuda
 
 
+def _forward(x, w1, b1, w2, update_rate, seed, fp32, growing):  # -> y, alive mask (growing) for the backward
+    K, B, C, H, W = x.shape
+    y = torch.empty_like(x)
+    n = (K * B, H, W) if growing else (0, 0, 0)
+    alpha, alive = torch.empty(n, device=x.device), torch.empty(n, dtype=torch.uint8, device=x.device)
+    nca_cuda.forward(x.view(K * B, C, H, W), w1, b1, w2, y.view(K * B, C, H, W), alpha, alive, B, seed, update_rate,
+                     fp32, growing, torch.cuda.current_stream(x.device).cuda_stream)
+    return y, alive
+
+
 class _Step(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, w1, b1, w2, update_rate, seed, fp32, growing):
-        K, B, C, H, W = x.shape
-        y = torch.empty_like(x)
-        n = (K * B, H, W) if growing else (0, 0, 0)
-        alpha, alive = torch.empty(n, device=x.device), torch.empty(n, dtype=torch.uint8, device=x.device)
-        nca_cuda.forward(x.view(K * B, C, H, W), w1, b1, w2, y.view(K * B, C, H, W), alpha, alive, B, seed, update_rate,
-                         fp32, growing, torch.cuda.current_stream(x.device).cuda_stream)
+        y, alive = _forward(x, w1, b1, w2, update_rate, seed, fp32, growing)
         ctx.save_for_backward(x, w1, b1, w2, alive)
         ctx.update_rate, ctx.seed, ctx.fp32, ctx.growing = update_rate, seed, fp32, growing
         return y
@@ -48,8 +53,26 @@ def new_seed():
 
 def step(x, w1, b1, w2, update_rate, growing=False, fp32=False, seed=None):
     seed = new_seed() if seed is None else seed
-    return _Step.apply(x.contiguous(), w1.contiguous(), b1.contiguous(), w2.contiguous(), float(update_rate), seed, fp32,
-                       growing)
+    args = (x.contiguous(), w1.contiguous(), b1.contiguous(), w2.contiguous(), float(update_rate), seed, fp32, growing)
+    if torch.is_grad_enabled() and (x.requires_grad or w1.requires_grad or b1.requires_grad or w2.requires_grad):
+        return _Step.apply(*args)
+    return _forward(*args)[0]  # inference: no autograd bookkeeping (~40 us less host time per step)
+
+
+@torch.no_grad()
+def rollout(x, w1, b1, w2, update_rate, steps, growing=False, fp32=False, seed=None):
+    """`steps` steps of step() without gradients, in one call (no Python per step; step seeds derived from `seed`)."""
+    seed = new_seed() if seed is None else seed
+    x, w1, b1, w2 = x.contiguous(), w1.contiguous(), b1.contiguous(), w2.contiguous()
+    K, B, C, H, W = x.shape
+    y = torch.empty_like(x)
+    tmp = torch.empty(K * B if steps > 1 else 0, C, H, W, device=x.device)  # ping-pong buffer
+    n = (K * B, H, W) if growing else (0, 0, 0)
+    alpha, alive = torch.empty(n, device=x.device), torch.empty(n, dtype=torch.uint8, device=x.device)
+    nca_cuda.rollout(x.view(K * B, C, H, W), w1, b1, w2, y.view(K * B, C, H, W), tmp, alpha, alive, steps, B, seed,
+                     float(update_rate), fp32, growing,
+                     torch.cuda.current_stream(x.device).cuda_stream)
+    return y
 
 
 def update_mask(n, h, w, seed, update_rate, device='cuda'):
