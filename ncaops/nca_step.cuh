@@ -387,11 +387,12 @@ __device__ void stage_forward_weights(ForwardSmem<C, HID, FP32> &sm, const float
 template <int C, int HID, bool FP32>
 constexpr int fwd_min_blocks() { return !FP32 && smem_fits(sizeof(ForwardSmem<C, HID, FP32>), 2) ? 2 : 1; }
 
-// grid (column strips * segments, N); each block: one segment of `seg` rows of one 16-pixel column strip
+// grid (column strips * segments, N); each block: one segment of `seg` rows of one 16-pixel column strip.
+// dirty, if supplied, marks writes into a reused rollout buffer; untouched cells keep its previous alive bit.
 template <int C, int HID, bool FP32, bool STOCH, bool ALIVE>
 __global__ void __launch_bounds__(FWD_THREADS, fwd_min_blocks<C, HID, FP32>()) forward_kernel(
     const float *__restrict__ x, const float *__restrict__ w1, const float *__restrict__ b1, const float *__restrict__ w2,
-    float *__restrict__ y, float *__restrict__ alpha, int B, int H, int W, uint64_t seed, float update_rate, int seg)
+    float *__restrict__ y, float *__restrict__ alpha, uint8_t *__restrict__ dirty, int B, int H, int W, uint64_t seed, float update_rate, int seg)
 {
     using S = Shape<C, HID>;
     extern __shared__ __align__(16) unsigned char smem_raw[];
@@ -535,8 +536,11 @@ __global__ void __launch_bounds__(FWD_THREADS, fwd_min_blocks<C, HID, FP32>()) f
                         continue;
                     const float v = sm.x.v[ch][o[h][1] + 1] + (u2[0][nt][2 * h + e] + u2[1][nt][2 * h + e]);
                     yn[ch * plane + pix] = v;
-                    if (ALIVE && ch == 3)
+                    if (ALIVE && ch == 3) {
                         an[pix] = v;
+                        if (dirty)
+                            dirty[n * plane + pix] = 1;
+                    }
                 }
         }
     };
@@ -604,8 +608,11 @@ __global__ void __launch_bounds__(FWD_THREADS, fwd_min_blocks<C, HID, FP32>()) f
 #pragma unroll
             for (int c = 0; c < C; ++c)
                 yn[c * plane + pix] = sm.x.at(c, s, lane % 16 + 1);
-            if (ALIVE)
+            if (ALIVE) {
                 an[pix] = sm.x.at(3, s, lane % 16 + 1);
+                if (dirty)
+                    dirty[n * plane + pix] = 1;
+            }
         }
         count += added;
         if (r0 + FWD_PHASE < y1)
@@ -625,9 +632,11 @@ __global__ void __launch_bounds__(FWD_THREADS, fwd_min_blocks<C, HID, FP32>()) f
 
 // Alive mask of a growing-NCA step: a = (maxpool3(x_alpha) > 0.1) & (maxpool3(alpha) > 0.1) without wrap-around,
 // alpha = the unmasked new alpha written by forward_kernel. y *= a; alive = a (for the backward). One thread per pixel.
+// reuse: alive initially marks cells that were live in this destination two steps ago, or written by this forward.
+// Other cells are already zero. The first two rollout steps clear unconditionally to establish this invariant.
 template <int C>
 __global__ void alive_kernel(const float *__restrict__ x, const float *__restrict__ alpha, float *__restrict__ y,
-                             uint8_t *__restrict__ alive, int H, int W, uint64_t total)
+                             uint8_t *__restrict__ alive, int H, int W, uint64_t total, bool reuse)
 {
     const uint64_t i = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x;  // n * H * W + Y * W + X
     if (i >= total)
@@ -647,8 +656,9 @@ __global__ void alive_kernel(const float *__restrict__ x, const float *__restric
             }
         }
     const bool a = mx > 0.1f && my > 0.1f;
+    const bool clear = !a && (!reuse || alive[i]);
     alive[i] = a;
-    if (!a)
+    if (clear)
 #pragma unroll
         for (int c = 0; c < C; ++c)
             y[(n * C + c) * plane + (i - n * plane)] = 0.f;

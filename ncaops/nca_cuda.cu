@@ -93,7 +93,7 @@ static int sm_count()
 // One step x -> y (N images of C x H x W, K = N / B NCAs) on `stream`; growing: alpha workspace and alive mask (N, H, W).
 static void launch_forward(const float *x, const float *w1, const float *b1, const float *w2, float *y, float *alpha,
                            uint8_t *alive, size_t N, size_t C, size_t HID, size_t H, size_t W, uint32_t B, uint64_t seed,
-                           float update_rate, bool fp32, bool growing, cudaStream_t stream)
+                           float update_rate, bool fp32, bool growing, cudaStream_t stream, bool reuse = false)
 {
     dispatch(C, HID, fp32, update_rate < 1.f, growing, [&](auto I) {
         using D = decltype(I);
@@ -109,19 +109,19 @@ static void launch_forward(const float *x, const float *w1, const float *b1, con
         while (seg > nca_step::FWD_PHASE && (size_t)N * strips * ceil_div(H, seg) < 2 * (size_t)blocks_per_sm * sm_count())
             seg = ceil_div(seg, 2);
         kernel<<<dim3(strips * ceil_div(H, seg), N), nca_step::FWD_THREADS, smem, stream>>>(
-            x, w1, b1, w2, y, alpha, B, H, W, seed, update_rate, seg);
+            x, w1, b1, w2, y, alpha, reuse ? alive : nullptr, B, H, W, seed, update_rate, seg);
         cuda_check(cudaGetLastError());
         if constexpr (D::ALIVE)
         {
             const uint64_t total = (uint64_t)N * H * W;
-            nca_step::alive_kernel<D::C><<<(unsigned)((total + 255) / 256), 256, 0, stream>>>(x, alpha, y, alive, H, W, total);
+            nca_step::alive_kernel<D::C><<<(unsigned)((total + 255) / 256), 256, 0, stream>>>(x, alpha, y, alive, H, W, total, reuse);
             cuda_check(cudaGetLastError());
         }
     });
 }
 
 static void validate_forward(FloatArray4D x, FloatArray3D w1, FloatArray2D b1, FloatArray3D w2, FloatArray4D y,
-                             FloatArray3D alpha, ByteArray3D alive, uint32_t batch_per_nca, bool growing)
+                             FloatArray3D alpha, ByteArray3D alive, uint32_t batch_per_nca, bool growing, bool rollout = false)
 {
     const size_t N = x.shape(0), C = x.shape(1), H = x.shape(2), W = x.shape(3), K = w1.shape(0), HID = w1.shape(1);
     if (N != K * batch_per_nca)
@@ -135,7 +135,7 @@ static void validate_forward(FloatArray4D x, FloatArray3D w1, FloatArray2D b1, F
         if (C < 4)
             throw std::runtime_error("a growing NCA needs at least 4 channels (alpha = channel 3)");
         validate_array_shape(alpha, {N, H, W}, "alpha");
-        validate_array_shape(alive, {N, H, W}, "alive");
+        validate_array_shape(alive, {rollout ? 2 * N : N, H, W}, "alive");
     }
 }
 
@@ -159,11 +159,12 @@ static uint64_t step_seed(uint64_t seed, uint64_t i)
 }
 
 // `steps` steps from x, ping-ponging between y and tmp so that the result ends in y (x is not modified).
+// Growing: one alive map per destination; after its first use, only dirty dead cells need to be zeroed.
 void rollout(FloatArray4D x, FloatArray3D w1, FloatArray2D b1, FloatArray3D w2, FloatArray4D y, FloatArray4D tmp,
              FloatArray3D alpha, ByteArray3D alive, uint32_t steps, uint32_t batch_per_nca, uint64_t seed,
              float update_rate, bool fp32, bool growing, uintptr_t stream_handle)
 {
-    validate_forward(x, w1, b1, w2, y, alpha, alive, batch_per_nca, growing);
+    validate_forward(x, w1, b1, w2, y, alpha, alive, batch_per_nca, growing, true);
     if (steps > 1)
         validate_array_shape(tmp, {x.shape(0), x.shape(1), x.shape(2), x.shape(3)}, "tmp");
     const auto stream = reinterpret_cast<cudaStream_t>(stream_handle);
@@ -173,9 +174,10 @@ void rollout(FloatArray4D x, FloatArray3D w1, FloatArray2D b1, FloatArray3D w2, 
     for (uint32_t i = 0; i < steps; ++i)
     {
         float *dst = (steps - i) % 2 ? y.data() : tmp.data();
-        launch_forward(src, w1.data(), b1.data(), w2.data(), dst, alpha.data(), alive.data(), x.shape(0), x.shape(1),
+        uint8_t *mask = growing ? alive.data() + (i % 2) * x.shape(0) * x.shape(2) * x.shape(3) : alive.data();
+        launch_forward(src, w1.data(), b1.data(), w2.data(), dst, alpha.data(), mask, x.shape(0), x.shape(1),
                        w1.shape(1), x.shape(2), x.shape(3), batch_per_nca, step_seed(seed, i), update_rate, fp32,
-                       growing, stream);
+                       growing, stream, growing && i >= 2);
         src = dst;
     }
 }

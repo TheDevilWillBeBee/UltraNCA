@@ -69,7 +69,8 @@ def rollout(x, w1, b1, w2, update_rate, steps, growing=False, fp32=False, seed=N
     y = torch.empty_like(x)
     tmp = torch.empty(K * B if steps > 1 else 0, C, H, W, device=x.device)  # ping-pong buffer
     n = (K * B, H, W) if growing else (0, 0, 0)
-    alpha, alive = torch.empty(n, device=x.device), torch.empty(n, dtype=torch.uint8, device=x.device)
+    alpha = torch.empty(n, device=x.device)
+    alive = torch.empty((2 * K * B, H, W) if growing else n, dtype=torch.uint8, device=x.device)
     nca_cuda.rollout(x.view(K * B, C, H, W), w1, b1, w2, y.view(K * B, C, H, W), tmp, alpha, alive, steps, B, seed,
                      float(update_rate), fp32, growing,
                      torch.cuda.current_stream(x.device).cuda_stream)
