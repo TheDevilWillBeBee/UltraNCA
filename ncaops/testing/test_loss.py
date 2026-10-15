@@ -86,6 +86,13 @@ def test_remd():
             torch.testing.assert_close(b, torch.full_like(b, val), rtol=0, atol=0)
         else:
             assert a.isnan().all() and b.isnan().all()
+    x = torch.ones(2, 73, 64, device='cuda'); x[:, 65] = float('nan')
+    y = torch.ones(2, 139, 64, device='cuda'); y[:, 129] = float('nan')
+    a, j, b, i = nearest(x, y, x.norm(dim=2), y.norm(dim=2))
+    expected_j = torch.full_like(j, 129); expected_j[:, 65] = 0
+    expected_i = torch.full_like(i, 65); expected_i[:, 129] = 0
+    assert a.isnan().all() and b.isnan().all()
+    assert torch.equal(j, expected_j) and torch.equal(i, expected_i)
     print('REMD ties and non-finite inputs: ok')
 
 

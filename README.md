@@ -38,6 +38,7 @@ python benchmark.py train infer --K 32
 | `config_growing.yml` | growing task (same schedule, 16 / 128 NCA) |
 | `train.py` | batched training loop, eager step, saving / previews / log (resumable: finished targets are skipped) |
 | `loss.py` | OT texture loss on VGG16 features: relaxed EMD (cosine) + mean / covariance matching over relu1_1 … relu5_1, 1024 random positions per layer; target features computed once per group (`cache_targets`: also the target terms of the unsampled layers), optional bf16 VGG (`vgg_bf16`) |
+| `loss_triton.py` | Tiled nearest-pair reductions for the compiled CUDA texture loss; TF32 / 3xTF32, fixed-order maxima |
 | `nca_triton.py` | fused Triton step (`impl: triton`) |
 | `ncaops/` | fused CUDA step (`impl: cuda`) |
 | `ncaops/nca_step.cuh` | CUDA kernels, with the per-GPU configuration and tuning knobs at the top |
@@ -230,10 +231,42 @@ Validation:
 
 Rejected experiment: staging a complete 16×4 adjoint tile and its feature halo in shared memory passed correctness but made the adjoint about 40% slower; it was removed. CUDA graph replay of the existing rollout showed only a small additional gain, so no graph-specific training path was added.
 
+### 8. Training-focused round (2026-10-15)
+
+Baseline: `ad1acd3`; loss: `fc19ba3`; CUDA backward / launch setup: `f2f0c03`. NCA precision remains TF32 by default and 3xTF32 for FP32. The eager PyTorch step is unchanged.
+
+Retained changes:
+- **Growing backward:** test the saved alive map before loading the tile or generating Philox masks. Completely dead tiles only clear their updating-map entries. Active tiles still overlap state loads with mask generation. No partial-gradient ordering changes; all 32 trained growing checkpoints below are bitwise identical to the baseline.
+- **Launch setup:** cache the backward kernel's shared-memory configuration, occupancy and device properties, and reuse the synchronization event. CUDA stream waits capture the event's record at the time of the call, so later records preserve the existing dependency order.
+- **Tiled REMD:** compute cosine similarities in 64×64 tiles and retain only row/column maxima and nearest-pair indices. For 64 images with 1024 samples, the partial values/indices take 16 MiB instead of a 256 MiB similarity matrix. Ties and NaNs select the first index. Explicit round-to-nearest TF32 conversion matches cuBLAS; FP32 uses 3xTF32. The existing nearest-pair backward is unchanged. Eager execution, CPU tensors, and PyTorch versions without `torch.library.triton_op` retain the original formulation.
+
+The isolated compiled texture loss (forward + backward, 128²) measured **36.45 → 34.18 ms** for 64 images and **75.67 → 69.59 ms** for 128 images.
+
+Training iterations below include a 64-step rollout, forward + backward, and the task loss, B = 2, 128². These are medians of 12 alternating measurements in one process, with identical tensors, fixed per-step seeds, matched loss-sampling seeds, and trained growing weights from `runs/emoji`:
+
+| task | K | before (ms) | after (ms) | time reduction |
+|---|---:|---:|---:|---:|
+| texture | 32 | 93.84 | 91.15 | 2.9% |
+| texture | 64 | 181.73 | 176.00 | 3.2% |
+| growing | 32 | 40.27 | 33.84 | 16.0% |
+| growing | 64 | 81.20 | 72.52 | 10.7% |
+
+Separate-process `benchmark.py train --K 32 64` measurements were noisier. Medians of three interleaved runs were texture K32 **93.8 → 95.2 ms**, K64 **190.0 → 184.0 ms**; growing K32 **40.9 → 34.3 ms**, K64 **83.8 → 73.9 ms**. The controlled comparison above was added to resolve the texture timing variation; the full-training gains are modest.
+
+**Full training and quality:** first 32 targets, all 768 iterations with the config schedules, random initialization, first iteration/compilation excluded. Texture seeds 0 / 1 took **70.73 / 69.06 → 69.14 / 68.87 s** (average **69.89 → 69.00 s**, 1.3% less). Growing seed 0 took **56.39 → 53.71 s**, 4.8% less. These are group times, not per-NCA times.
+
+For textures, median final training-loss ratios were 0.9987 / 0.9994. Held-out evaluation used three independent 256-step rollouts per target and seed, with FP32 VGG and matched sampling seeds. Across both seeds the ratio of mean losses was **1.0074**, and the median paired ratio was **1.0084**; preview contact sheets showed comparable texture quality. Growing checkpoints are bitwise identical for all 32 targets, so their held-out losses also match exactly. No FP16 NCA math was introduced.
+
+Validation: `python ncaops/testing/test_nca.py` and `python ncaops/testing/test_loss.py` pass. The latter now checks tiled REMD values, gradients, both precisions, strided inputs, partial tiles, independent images, determinism, ties and NaNs across tile boundaries. CUDA graph capture/replay of the chunked backward also completed with the reused event.
+
+Rejected experiments: staging small weight panels in the texture backward's expired input-tile buffer introduced spills/barriers and slowed its rollout from roughly 53 to 58 ms. A backward chunk-size sweep found no consistent gain over the existing policy. Delaying growing state loads until after mask generation was slightly slower in full training than checking living tiles first and retaining the load overlap (55.49 vs 53.71 s).
+
+Local artifacts are under `runs/training-frontier/` (ignored by git): `report.json`, `paired-training.py` / `.json`, `final-*.txt`, loss profiles, build/test logs, both seeds' texture checkpoints and contact sheets, and growing checkpoints. The final growing training run is `preload-growing-final/`; the earlier `candidate-growing/` run is the delayed-load variant, with identical weights.
+
 ## Planned next steps (in rough order of expected gain)
 
 1. **Backward occupancy / latency**: 255 registers and ~47 KB of shared memory per 4-warp block give 8 warps per SM, and the kernel issues every 9 cycles per warp (stalls: tensor pipe 2.4, weight-fragment loads 2.0, dependencies 1.7, barriers 1.6 cycles per instruction). On the A100 / H100 (164 / 228 KB), an 8-warp block of two 4-warp teams with the weight fragments resident in shared memory (~140 KB) would remove the fragment-load stalls; it does not fit 100 KB. Tried and dropped: two warps per pixel group (8-warp blocks at 128 registers, 16 warps per SM): twice the instructions per MMA, 15–30 % slower; a 168-register cap (spills).
 2. **Fusing the adjoint** stays a loss on 100 KB GPUs (see above); with 164 KB or more, the gather could stage a tile's dp in shared memory instead of reading it 9 times from L2.
-3. **OT loss** (40 ms of a 93 ms texture iteration): the pooling index traffic is reduced in section 7; the gradient of the 1024 sampled feature positions is still materialized as a dense scatter per layer (~1 ms), and the cuDNN TF32 conversion passes (3.9 ms) would only go away with a different convolution implementation; bf16 VGG (validated, opt-in) halves the whole loss.
+3. **OT loss**: sections 7–8 reduce pooling and REMD traffic. The remaining loss cost is mostly frozen VGG convolutions and their backward; the cuDNN TF32 conversion passes alone take about 3.4 ms for 64 images. The gradient of the 1024 sampled feature positions still materializes a dense scatter (~1 ms). bf16 VGG remains a validated opt-in.
 4. **Sparse growing grids**: redundant clearing and alive-mask scans are removed in section 7; the forward still scans all strips for living cells. Tracking active tiles could reduce this remaining cost on very large, mostly empty grids.
 5. **Other GPUs**: H100 `wgmma`; other (C, HID) instantiations (`dispatch()` in `nca_cuda.cu`; C a multiple of 4, HID a multiple of 32).
