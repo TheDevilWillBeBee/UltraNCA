@@ -823,7 +823,26 @@ __global__ void __launch_bounds__(BWD_THREADS, BWD_MIN_BLOCKS) backward_kernel(
     for (int tile = blockIdx.x * BWD_TILES_PER_BLOCK; tile < min(tiles, (blockIdx.x + 1) * BWD_TILES_PER_BLOCK); ++tile) {
         const int y0 = (tile / tiles_x) * TH, x0 = (tile % tiles_x) * TILE_W;
         typename Tile<C, TH>::template Regs<BWD_THREADS> xr;
-        sm.x.template fetch<BWD_THREADS>(xr, xn, H, W, y0, x0);
+        if constexpr (!ALIVE)  // overlap dense loads with mask generation; growing tiles may be entirely dead
+            sm.x.template fetch<BWD_THREADS>(xr, xn, H, W, y0, x0);
+        // Skip completely dead growing tiles before drawing Philox masks or loading the state.
+        uint32_t live[WORDS];
+        if constexpr (ALIVE) {
+            int count = 0;
+#pragma unroll
+            for (int w = 0; w < WORDS; ++w) {
+                const int px = 32 * w + lane, Y = y0 + px / TILE_W, X = x0 + px % TILE_W;
+                live[w] = __ballot_sync(~0u, px < TPIX && Y < H && X < W && alive[((size_t)n * H + Y) * W + X]);
+                count += __popc(live[w]);
+            }
+            if (count == 0) {
+                const int px = threadIdx.x, Y = y0 + px / TILE_W, X = x0 + px % TILE_W;
+                if (px < TPIX && Y < H && X < W)
+                    updating[(size_t)n * plane + (size_t)Y * W + X] = 0;
+                continue;  // no shared writes: the next live tile's barrier still protects the previous tile
+            }
+            sm.x.template fetch<BWD_THREADS>(xr, xn, H, W, y0, x0);
+        }
         // the updating pixels of the tile, as bit words (every warp computes them all: block-uniform count)
         const uint4 masks = warp_masks<STOCH, TH>(seed, update_rate, n, H, W, y0, x0);
         uint32_t words[WORDS];
@@ -832,7 +851,7 @@ __global__ void __launch_bounds__(BWD_THREADS, BWD_MIN_BLOCKS) backward_kernel(
         for (int w = 0; w < WORDS; ++w) {
             const int px = 32 * w + lane, Y = y0 + px / TILE_W, X = x0 + px % TILE_W;
             const bool up = px < TPIX && Y < H && X < W && mask_at(masks, px / TILE_W, px % TILE_W) != 0.f &&
-                            (!ALIVE || alive[((size_t)n * H + Y) * W + X]);
+                            (!ALIVE || ((live[w] >> lane) & 1u));
             words[w] = __ballot_sync(~0u, up);
             count += __popc(words[w]);
         }

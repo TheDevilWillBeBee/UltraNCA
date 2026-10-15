@@ -196,10 +196,8 @@ static int backward_blocks_per_image(int H, int W, bool stoch)
 // at least N / 4 images per chunk. Measured on sm_89: 15-20 % faster than one launch.
 static size_t chunk_images(size_t N, size_t C, size_t H, size_t W, int blocks_per_image, int blocks_per_sm, bool growing)
 {
-    int dev, sms, l2;
-    cudaGetDevice(&dev);
-    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
-    cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, dev);
+    const int sms = sm_count();
+    static const int l2 = [] { int dev, v; cudaGetDevice(&dev); cudaDeviceGetAttribute(&v, cudaDevAttrL2CacheSize, dev); return v; }();
     const size_t wave = sms * blocks_per_sm / blocks_per_image, fit = l2 / 2 / (4 * C * H * W * sizeof(float));
     const size_t chunk = growing ? std::min<size_t>(2 * fit, (N + 3) / 4) : std::min<size_t>(2 * wave / 3, fit);
     return std::clamp<size_t>(chunk, 1, N);
@@ -216,11 +214,10 @@ static cudaStream_t side_stream(int i)
 // `waiter` waits for the work enqueued so far on `stream`.
 static void join(cudaStream_t waiter, cudaStream_t stream)
 {
-    cudaEvent_t e;
-    cuda_check(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+    // A wait captures the latest record at the time of the call; subsequent records do not change that wait.
+    static cudaEvent_t e = [] { cudaEvent_t t; cuda_check(cudaEventCreateWithFlags(&t, cudaEventDisableTiming)); return t; }();
     cuda_check(cudaEventRecord(e, stream));
     cuda_check(cudaStreamWaitEvent(waiter, e, 0));
-    cuda_check(cudaEventDestroy(e));  // released once complete
 }
 
 // Workspace sizes for backward(): (packed weight bytes per NCA, partial floats per image, images per chunk).
@@ -231,9 +228,12 @@ std::tuple<size_t, size_t, size_t> backward_workspace(size_t C, size_t HID, bool
         using D = decltype(I);
         auto kernel = nca_step::backward_kernel<D::C, D::HID, D::FP32, D::STOCH, D::ALIVE>;
         constexpr int smem = sizeof(nca_step::BackwardSmem<D::C, D::HID, nca_step::bwd_tile_h(D::STOCH)>);
-        set_smem(kernel, smem);
-        int blocks_per_sm;
-        cuda_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, kernel, nca_step::BWD_THREADS, smem));
+        static const int blocks_per_sm = [&] {
+            set_smem(kernel, smem);
+            int b;
+            cuda_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&b, kernel, nca_step::BWD_THREADS, smem));
+            return b;
+        }();
         const int blocks = backward_blocks_per_image(H, W, D::STOCH);
         return std::make_tuple(sizeof(nca_step::BackwardWeights<D::C, D::HID, D::FP32>),
                                (size_t)blocks * nca_step::BwdShape<D::C, D::HID>::PARTIAL,
@@ -280,7 +280,6 @@ void backward(FloatArray4D x, FloatArray4D gy, ByteArray3D alive, FloatArray3D w
 
         auto kernel = nca_step::backward_kernel<D::C, D::HID, D::FP32, D::STOCH, D::ALIVE>;
         constexpr int smem = sizeof(nca_step::BackwardSmem<D::C, D::HID, nca_step::bwd_tile_h(D::STOCH)>);
-        set_smem(kernel, smem);
         const int blocks = backward_blocks_per_image(H, W, D::STOCH);
         const size_t plane = H * W;
         const bool split = chunk < N;
