@@ -37,9 +37,14 @@ class _REMD(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, y):
         nx, ny = x.norm(dim=2), y.norm(dim=2)
-        sim = x @ y.transpose(1, 2) / (nx[:, :, None] * ny[:, None, :] + 1e-10)  # 1 - cos
-        near_y, j = sim.max(2)  # per x_i: the nearest y_j
-        near_x, i = sim.max(1)  # per y_j: the nearest x_i
+        if (torch.compiler.is_compiling() and x.is_cuda and x.dtype == torch.float32
+                and hasattr(torch.library, 'triton_op')):
+            from loss_triton import nearest
+            near_y, j, near_x, i = nearest(x, y, nx, ny)
+        else:
+            sim = x @ y.transpose(1, 2) / (nx[:, :, None] * ny[:, None, :] + 1e-10)  # 1 - cos
+            near_y, j = sim.max(2)  # per x_i: the nearest y_j
+            near_x, i = sim.max(1)  # per y_j: the nearest x_i
         per_x, per_y = 1 - near_y.mean(1), 1 - near_x.mean(1)
         ctx.save_for_backward(x, y, nx, ny, i, j, per_x > per_y)
         return torch.maximum(per_x, per_y)
