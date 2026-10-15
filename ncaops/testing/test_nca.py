@@ -96,15 +96,37 @@ def test():
                 print(f'{C:2d}/{HID:3d} rate={rate} {"growing" if growing else "texture"}: fp32 fwd {fwd[True]:.1e} grad '
                       f'{bwd[True]:.1e} | tf32 fwd {fwd[False]:.1e} grad {bwd[False]:.1e} | deterministic {det} | '
                       + (f'alive flips {flips[True]} / {flips[False]} | ' if growing else '') + f'{"ok" if passed else "FAILED"}', flush=True)
-    for growing in (False, True):  # rollout = repeated steps (every cell updating: no dependence on the seeds)
-        x, w1, b1, w2 = make(2, 2, 16, 128, 40, 48, growing=growing)
-        for steps in (0, 1, 2, 5):
-            ref = x
-            for _ in range(steps):
-                ref = nca_ops.step(ref, w1, b1, w2, 1.0, growing)
-            same = torch.equal(nca_ops.rollout(x, w1, b1, w2, 1.0, steps, growing), ref)
+    def step_seed(seed, i):  # splitmix64, as in nca_cuda.cu
+        mask = (1 << 64) - 1
+        z = (seed + (i + 1) * 0x9E3779B97F4A7C15) & mask
+        z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & mask
+        z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & mask
+        return z ^ (z >> 31)
+
+    for C, HID in ((12, 96), (16, 128)):
+        for growing in (False, True):
+            x, w1, b1, w2 = make(2, 2, C, HID, 37, 50, growing=growing)
+            original = x.clone()
+            same = True
+            for fp32 in (False, True):
+                for rate in (0., 0.5, 1.):
+                    ref = x
+                    for steps in range(8):
+                        if steps:
+                            ref = nca_ops.step(ref, w1, b1, w2, rate, growing, fp32, seed=step_seed(99, steps - 1))
+                        same &= torch.equal(nca_ops.rollout(x, w1, b1, w2, rate, steps, growing, fp32, seed=99), ref)
+            same &= torch.equal(x, original)
             ok &= same
-            print(f'rollout {steps} steps {"growing" if growing else "texture"}: {"ok" if same else "FAILED"}')
+            print(f'rollout {C}/{HID} {"growing" if growing else "texture"}, both precisions, rates 0/0.5/1: {"ok" if same else "FAILED"}')
+
+        # A dense living grid dies after four steps: both reused destinations must clear their stale states.
+        x = torch.ones(1, 1, C, 8, 16, device='cuda'); x[:, :, 3] = 0.2
+        w1 = torch.zeros(1, HID, 4 * C, device='cuda'); b1 = torch.ones(1, HID, device='cuda')
+        w2 = torch.full((1, C, HID), 0.01, device='cuda'); w2[:, 3] = -0.025 / HID
+        y = nca_ops.rollout(x, w1, b1, w2, 1., 7, True, seed=99)
+        same = torch.equal(y, torch.zeros_like(y))
+        ok &= same
+        print(f'rollout {C}/{HID} dying grid: {"ok" if same else "FAILED"}')
     m = nca_ops.update_mask(4, 128, 128, 7, 0.5)
     print(f'mask: mean {m.mean().item():.4f} (expect 0.5), values {sorted(m.unique().tolist())}')
     print('all passed' if ok else 'SOME CASES FAILED')
