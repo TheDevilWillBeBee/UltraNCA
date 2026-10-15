@@ -60,7 +60,7 @@ Default schedule (`config.yml`):
 
 This is the batch-2 point of a batch-size study at a fixed sample budget. It came within about 3 % of the original 1500-iteration batch-4 schedule when started from a good (decoder-predicted) initialisation. From a **random** init (the default here), a longer schedule may be needed for full quality. That does not matter for speed work.
 
-## What was done (sections 1–3 and the A100 check: one A100 80 GB; sections 5–8: RTX 4090; section 9: A100 tuning)
+## What was done (sections 1–3 and the A100 check: one A100 80 GB; sections 5–8 and 10: RTX 4090; section 9: A100 tuning)
 
 ### 1. Batching NCAs on different targets
 
@@ -317,7 +317,31 @@ Quality (final losses of `train.py` on the first 32 textures / 32 emojis, seed 0
 
 The OT loss was not touched: it is about 27 ms of a texture iteration on the A100 (`benchmark.py train` minus 64 steps: 28 % of the iteration; 40 ms and 40 % on the 4090).
 
-`test_nca.py`: one 16/128 growing case at update rate 1 has a cell whose new alpha is 0.100131 in fp32 and falls below the alive threshold under TF32 rounding on the A100, taking its 8 neighbours with it (relative error 1.5e-2 against the 1e-2 bound). Such alive flips are now excluded from the forward error and counted instead (at most 32 per case; the error without them is 3.9e-4).
+`test_nca.py`: one 16/128 growing case at update rate 1 has a cell whose new alpha is 0.100131 in fp32 and falls below the alive threshold under TF32 rounding on the A100, taking its 8 neighbours with it (relative error 1.5e-2 against the 1e-2 bound). Such alive flips are excluded from the forward error and counted instead (at most 32 per case; the error without them is 3.9e-4). Section 10 strengthens this check to verify that each excluded difference actually comes from the alive predicate.
+
+### 10. Merge validation on the RTX 4090 (2026-10-15)
+
+Reviewed `7f576b9` against the previous 4090 version, `3009b9b`, and rebuilt with CUDA 13.0, sm_89, `NCA_SMEM_PER_SM_KB=100`. The installed extension before this check was still the old binary; pulling source alone does not rebuild it. The merge changes the CUDA kernels, dispatch and tests; the OT loss and training loop are unchanged. The 4090 retains unroll 2, the 2-channel / 4-row adjoint, two-part growing backward staging, chunked backward, and the original forward grid. Main training-kernel resources match the baseline: forward 128 / 189 registers, backward 255 registers with 16 / 40 bytes of spill stores and loads, adjoints 44 / 48 registers (texture / growing, this CUDA toolchain).
+
+Paired training benchmark: same process, identical inputs and loss, alternating binaries, 16 measurements per binary after warmup; median CUDA-event times. B = 2, update rate 0.5, 64 steps plus loss and backward, without the pool and Adam update. Growing uses the trained 8k graft checkpoints at 128², and the random-init 8k checkpoints at 64²; these have different alive areas from section 8's older `runs/emoji` checkpoints, so their absolute times differ.
+
+| workload | before (ms) | merged (ms) | change |
+|---|---:|---:|---:|
+| texture, K = 32, 128² | 95.68 | 95.84 | +0.17% |
+| texture, K = 64, 128² | 190.69 | 189.65 | −0.55% |
+| growing, K = 32, 128² | 72.23 | 72.01 | −0.30% |
+| growing, K = 64, 128² | 135.75 | 136.93 | +0.87% |
+| growing, K = 32, 64² | 24.18 | 24.57 | +1.64% |
+
+No meaningful 4090 regression was observed. The 64² run is sensitive to host scheduling (individual samples span 22–27 ms). Full 768-iteration training on the first 32 targets, seed 0, excluding compilation: texture 70.70 → 70.73 s, growing 56.67 → 55.29 s. All 32 growing models have bitwise identical final weights and losses. Texture final mean training loss changes by +0.39%; evaluation over three 256-step rollouts changes by −0.70% (mean OT loss 2.8959 → 2.8755). The contact sheets show comparable texture quality; these differences are consistent with the existing OT training nondeterminism described above.
+
+Validation: both `test_nca.py` and `test_loss.py` pass. A separate comparison covers 120 combinations of model size, growing mask, precision, rate 0 / 0.5 / 1, and shapes from 8×16 through 80², K = 32 at 128², and 129×65: four-step outputs and all four gradients, plus sixteen-step rollouts, are bitwise equal to the pre-merge binary.
+
+The review found a gap in the new alive-flip test: identifying flips solely from zero outputs could excuse up to 32 incorrectly erased cells. The test now computes the unmasked CUDA result, applies the reference alive predicate to it, and requires exact equality with the growing output. Only mask differences derived from those alphas are excluded from the FP32-reference error; the unmasked arithmetic error is checked too. Added 80² and 129×65 cases (a one-row final segment), and explicit equality checks between two-stream chunks, one launch, and automatic dispatch. No production-kernel changes were needed.
+
+Also exercised the A100 paths on the 4090 with `-DNCA_FWD_TAIL=1 -DNCA_BWD_UNROLL=6 -DNCA_ADJ_CPT_GROWING=4 -DNCA_ADJ_ROWS_GROWING=2 -DNCA_BWD_HPARTS=1`, keeping the actual 100 KB memory limit. The strengthened suite passes, the same 120 comparisons remain bitwise equal, and Compute Sanitizer memcheck reports zero errors on 129×65 forward/backward/rollout cases including empty half-segments. This validates those code paths, not A100 performance; no A100 was available for this review. The installed extension was restored to the default 4090 build afterward.
+
+Local artifacts: `runs/perf-merge-4090/` (ignored), including both binaries, build and test logs, `paired-training.py` / `.json`, `compare.py` / `.json`, training configs/checkpoints, `quality-report.json`, and `quality-texture.png` / `quality-growing.png`.
 
 ## Planned next steps (in rough order of expected gain)
 

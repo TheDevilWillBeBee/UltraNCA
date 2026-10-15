@@ -12,7 +12,8 @@ FILTERS = torch.stack([torch.tensor([[0., 0, 0], [0, 1, 0], [0, 0, 0]]), torch.t
                        torch.tensor([[-1., -2, -1], [0, 0, 0], [1, 2, 1]]), torch.tensor([[1., 2, 1], [2, -12, 2], [1, 2, 1]])])[:, None]
 # relative-error bounds: fp32 = 3xTF32; TF32 errors are those of TF32 itself (eager PyTorch TF32 vs FP32 is the same).
 # A growing-NCA cell whose alive test (alpha > 0.1) flips under TF32 rounding differs by its whole state (and so do its
-# 8 neighbours): such cells are excluded from the forward error and counted instead (at most FLIPS per case).
+# 8 neighbours). Check the mask exactly against the unmasked CUDA step, then exclude confirmed flips from the
+# forward error and count them (at most FLIPS across the shapes of each case).
 BOUNDS = {True: (1e-5, 1e-5), False: (1e-2, 3e-2)}  # fp32: (forward, gradients)
 FLIPS = {True: 0, False: 32}
 
@@ -33,15 +34,6 @@ def reference_step(x, w1, b1, w2, mask, growing=False):
 
 def rel(a, b):
     return ((a - b).norm() / b.norm()).item()
-
-
-def forward_error(out, ref, growing):
-    """Relative error of a step; growing: without the cells that are dead (all channels 0) on one side only, whose
-    number is returned too."""
-    if not growing:
-        return rel(out, ref), 0
-    flip = (out == 0).all(2, keepdim=True) != (ref == 0).all(2, keepdim=True)
-    return rel(out.masked_fill(flip, 0), ref.masked_fill(flip, 0)), flip.sum().item()
 
 
 def make(K, B, C=12, HID=96, H=128, W=128, seed=0, growing=False):
@@ -72,12 +64,23 @@ def test():
             for growing in (False, True):
                 fwd, bwd, det = {True: 0., False: 0.}, {True: 0., False: 0.}, True
                 flips = {True: 0, False: 0}
-                for K, B, H, W in ((3, 2, 128, 128), (2, 3, 37, 50), (1, 1, 8, 16)):
+                # 129 rows also exercises a one-row final segment (including an empty half with NCA_FWD_TAIL).
+                for K, B, H, W in ((3, 2, 128, 128), (2, 3, 37, 50), (1, 1, 8, 16), (3, 2, 80, 80), (17, 2, 129, 65)):
                     x, w1, b1, w2 = make(K, B, C, HID, H, W, growing=growing)
-                    ref = reference_step(x, w1, b1, w2, mask_for(K, B, H, W, 1234, rate), growing)
+                    ref_raw = reference_step(x, w1, b1, w2, mask_for(K, B, H, W, 1234, rate))
+                    ref_alive = alive(x) & alive(ref_raw) if growing else None
+                    ref = ref_raw * ref_alive if growing else ref_raw
                     for fp32 in (True, False):
-                        err, n = forward_error(nca_ops.step(x, w1, b1, w2, rate, growing, fp32=fp32, seed=1234), ref, growing)
-                        fwd[fp32] = max(fwd[fp32], err); flips[fp32] += n
+                        out = nca_ops.step(x, w1, b1, w2, rate, growing, fp32=fp32, seed=1234)
+                        err = rel(out, ref)
+                        if growing:
+                            raw = nca_ops.step(x, w1, b1, w2, rate, False, fp32=fp32, seed=1234)
+                            out_alive = alive(x) & alive(raw)
+                            assert torch.equal(out, raw * out_alive), 'growing step must apply the exact alive mask'
+                            flip = out_alive != ref_alive
+                            flips[fp32] += flip.sum().item()
+                            err = max(rel(raw, ref_raw), rel(out.masked_fill(flip, 0), ref.masked_fill(flip, 0)))
+                        fwd[fp32] = max(fwd[fp32], err)
                 for K, B, H, W in ((3, 2, 64, 64), (2, 3, 37, 50)):
                     x, w1, b1, w2 = make(K, B, C, HID, H, W, growing=growing)
                     R, mask = torch.randn_like(x), mask_for(K, B, H, W, 99, rate)
@@ -87,10 +90,9 @@ def test():
                     for fp32 in (True, False):
                         out = grads(lambda *p: nca_ops.step(*p, rate, growing, fp32=fp32, seed=99))
                         bwd[fp32] = max([bwd[fp32]] + [rel(a, b) for a, b in zip(out, ref)])
-                    nca_ops.CHUNK = 2  # the backward in chunks on two streams
-                    det &= all(torch.equal(a, b) for a, b in zip(out, grads(lambda *p: nca_ops.step(*p, rate, growing, seed=99))))
-                    nca_ops.CHUNK = None
-                    det &= all(torch.equal(a, b) for a, b in zip(out, grads(lambda *p: nca_ops.step(*p, rate, growing, seed=99))))
+                    for chunk in (2, K * B, None):  # two streams, one launch, automatic choice for this GPU
+                        nca_ops.CHUNK = chunk
+                        det &= all(torch.equal(a, b) for a, b in zip(out, grads(lambda *p: nca_ops.step(*p, rate, growing, seed=99))))
                 passed = det and all(fwd[p] < BOUNDS[p][0] and bwd[p] < BOUNDS[p][1] and flips[p] <= FLIPS[p] for p in (True, False))
                 ok &= passed
                 print(f'{C:2d}/{HID:3d} rate={rate} {"growing" if growing else "texture"}: fp32 fwd {fwd[True]:.1e} grad '
