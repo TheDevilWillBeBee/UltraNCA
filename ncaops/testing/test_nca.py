@@ -54,6 +54,33 @@ def mask_for(K, B, H, W, seed, rate):
     return nca_ops.update_mask(K * B, H, W, seed, rate).view(K, B, 1, H, W)
 
 
+def test_chunking():
+    """Chunk choices around N/2 and N must give the same gradients as one launch, including automatic dispatch."""
+    ok, saved_chunk = True, nca_ops.CHUNK
+    try:
+        for K, B in ((32, 1), (16, 2), (5, 1)):
+            N = K * B
+            for C, HID in ((12, 96), (16, 128)):
+                for growing in (False, True):
+                    params = [t.requires_grad_() for t in make(K, B, C, HID, 64, 64, growing=growing)]
+                    R, same = torch.randn_like(params[0]), True
+                    for fp32 in (False, True):
+                        def grads():
+                            out = nca_ops.step(*params, 0.5, growing, fp32, seed=99)
+                            return torch.autograd.grad((out * R).sum(), params)
+                        nca_ops.CHUNK = N
+                        ref = grads()
+                        for chunk in (2, N // 2, N // 2 + 1, N - 1, N + 1, None):
+                            nca_ops.CHUNK = chunk
+                            same &= all(torch.equal(a, b) for a, b in zip(ref, grads()))
+                    ok &= same
+                    print(f'chunk boundaries {C}/{HID} {"growing" if growing else "texture"}, K={K} B={B}, '
+                          f'64^2, both precisions: {"ok" if same else "FAILED"}', flush=True)
+    finally:
+        nca_ops.CHUNK = saved_chunk
+    return ok
+
+
 def test():
     """Per case and precision: the largest relative error of the forward over several shapes (including partial
     tiles), of the gradients (dx, dw1, db1, dw2) over two shapes, and whether TF32 backward runs (also in several image chunks) are bitwise equal."""
@@ -129,6 +156,7 @@ def test():
         same = torch.equal(y, torch.zeros_like(y))
         ok &= same
         print(f'rollout {C}/{HID} dying grid: {"ok" if same else "FAILED"}')
+    ok &= test_chunking()
     m = nca_ops.update_mask(4, 128, 128, 7, 0.5)
     print(f'mask: mean {m.mean().item():.4f} (expect 0.5), values {sorted(m.unique().tolist())}')
     print('all passed' if ok else 'SOME CASES FAILED')

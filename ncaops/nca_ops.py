@@ -36,7 +36,7 @@ class _Step(torch.autograd.Function):
         packed = torch.empty(K * packed_bytes, dtype=torch.uint8, device=x.device)
         partial = torch.empty(K * B * partial_floats, device=x.device)
         chunk = CHUNK or chunk
-        dp = torch.empty(K * B if chunk >= K * B else 2 * chunk, H, W, 4 * C, device=x.device)  # all, or 2 chunks
+        dp = torch.empty(min(K * B, 2 * chunk), H, W, 4 * C, device=x.device)  # all, or 2 chunks smaller than the batch
         gx, dw1, db1, dw2 = torch.empty_like(x), torch.empty_like(w1), torch.empty_like(b1), torch.empty_like(w2)
         updating = torch.empty(K * B, H, W, dtype=torch.uint8, device=x.device)
         nca_cuda.backward(x.view(K * B, C, H, W), gy.contiguous().view(K * B, C, H, W), alive, w1, b1, w2,
