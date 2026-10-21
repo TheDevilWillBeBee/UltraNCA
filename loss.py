@@ -35,9 +35,9 @@ class _REMD(torch.autograd.Function):
     for x (b, n, c) and y (b, m, c) (no gradient to y). Returns (b,)."""
 
     @staticmethod
-    def forward(ctx, x, y):
+    def forward(ctx, x, y, tiled=False):  # tiled: the Triton nearest pairs also in eager mode
         nx, ny = x.norm(dim=2), y.norm(dim=2)
-        if (torch.compiler.is_compiling() and x.is_cuda and x.dtype == torch.float32
+        if ((tiled or torch.compiler.is_compiling()) and x.is_cuda and x.dtype == torch.float32
                 and hasattr(torch.library, 'triton_op')):
             from loss_triton import nearest
             near_y, j, near_x, i = nearest(x, y, nx, ny)
@@ -62,7 +62,7 @@ class _REMD(torch.autograd.Function):
         gx = -(g / n)[:, None, None] * dsim(x, nx, y.gather(1, j[..., None].expand(-1, -1, c)), ny.gather(1, j))
         gy_side = -(g / y.shape[1])[:, None, None] * dsim(x.gather(1, i[..., None].expand(-1, -1, c)), nx.gather(1, i), y, ny)
         gx = torch.where(x_side[:, None, None], gx, torch.zeros_like(gx).scatter_add_(1, i[..., None].expand(-1, -1, c), gy_side))
-        return gx, None
+        return gx, None, None
 
 
 def _moments(y):  # (b, n, c) -> mean (b, 1, c), covariance (b, c, c)

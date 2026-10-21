@@ -33,3 +33,9 @@ if (NCA_DEFS)
   target_compile_options(nca_cuda PRIVATE ${NCA_DEFS_LIST})
 endif()
 target_include_directories(nca_cuda PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+
+# LPPN decoder (lppn.py): its own module
+nanobind_add_module(lppn_cuda lppn_cuda.cu)
+set_property(TARGET lppn_cuda PROPERTY CUDA_SEPARABLE_COMPILATION OFF)
+target_compile_options(lppn_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=-v>)
+target_include_directories(lppn_cuda PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})

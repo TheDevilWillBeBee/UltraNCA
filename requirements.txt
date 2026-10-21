@@ -5,3 +5,4 @@ pillow
 pyyaml
 gdown             # prepare/download_pbr.py
 nanobind          # ncaops/ (also needs cmake >= 3.18 and the CUDA toolkit, sm_80+)
+matplotlib        # plot_eval.py

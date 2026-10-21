@@ -17,6 +17,10 @@ The growing NCA has 16 channels and 128 hidden units; the stochastic update can 
 
 Weights are saved in the vanilla format: `w1.weight` (96, 48, 1, 1), `w1.bias` (96,), `w2.weight` (12, 96, 1, 1).
 
+`train_lppn.py` trains the hybrid NCA + neural-field decoder textures of Cells2Pixels (a 16 / 128 NCA per target, a
+small SIREN decoding each cell to a higher-resolution image, and the multi-scale OT loss), with fused CUDA kernels for
+the decoder: see [section 11](#11-hybrid-nca--lppn-textures-cells2pixels-rtx-4090-2026-10-20--21).
+
 ## Quick start
 
 ```bash
@@ -28,6 +32,10 @@ python ncaops/testing/test_nca.py   # CUDA kernels vs a PyTorch reference (add -
 python train.py                     # config.yml -> runs/pbr/<texture>.pt, <texture>.png (target | NCA), log.json
 python train.py config_growing.yml  # growing NCAs -> runs/emoji
 python benchmark.py train infer --K 32
+python ncaops/testing/test_lppn.py     # fused decoder kernels vs PyTorch (+ Cells2Pixels' LocalEnsembleSiren if ../Cells2Pixels exists)
+python ncaops/testing/test_loss_ms.py  # multi-scale OT loss vs Cells2Pixels' AppearanceLoss (needs ../Cells2Pixels or $C2P)
+python train_lppn.py                   # config_lppn.yml -> runs/lppn/<texture>/{model.pth, siren.pth}, <texture>.png, log.json
+python benchmark_lppn.py --settings A B C --modes whole crops
 ```
 
 ## Files
@@ -50,6 +58,15 @@ python benchmark.py train infer --K 32
 | `benchmark.py` | steady-state cost per training iteration (`train`) and of no-grad rollouts (`infer`) vs K and `impl` |
 | `prepare/download_pbr.py` | PBR dataset download (same source as Cells2Pixels), albedo maps only |
 | `prepare/download_emoji.py` | 64 Noto emojis (v2.047) for the growing task |
+| `config_lppn.yml` | hybrid NCA + decoder textures (Cells2Pixels): targets, render size, NCA, decoder (`mode`, `jitter`), schedule, loss (`target_mode`, `pairing`, `crops`, `vgg_bf16`) |
+| `train_lppn.py` | its training loop: K NCAs x B samples, one decoder per NCA; checkpoints in the Cells2Pixels format |
+| `lppn.py` | the decoders: local ensemble (default) and LPPN, their PyTorch references, the per-cell / per-position decomposition, jitter, Cells2Pixels state_dict conversion |
+| `loss_ms.py` | multi-scale OT appearance loss of Cells2Pixels for N images with their own targets: whole target or target crops (pooled / paired), crops per scale, chunked VGG with the image gradient computed in the forward |
+| `ncaops/lppn_decoder.cuh`, `ncaops/lppn_cuda.cu`, `ncaops/lppn_ops.py` | fused decoder kernels (forward, backward, reductions), bindings (module `lppn_cuda`), autograd wrapper |
+| `ncaops/testing/test_lppn.py`, `ncaops/testing/test_loss_ms.py` | correctness tests (and `--bench`) of the decoder kernels and the multi-scale loss |
+| `benchmark_lppn.py` | cost of one hybrid training iteration and its parts per setting, VGG precision, target mode and decoder |
+| `eval_lppn.py`, `plot_eval.py` | common evaluation of trained hybrid models (any run directory in the Cells2Pixels format, any output scale) and its figure |
+| `figures/` | local, ignored by git: figures and scores of the section 11 experiments (`eval_lppn.py`, `plot_eval.py`) |
 
 Default schedule (`config.yml`):
 - batch 2 per NCA, pool 64, 768 iterations;
@@ -60,7 +77,7 @@ Default schedule (`config.yml`):
 
 This is the batch-2 point of a batch-size study at a fixed sample budget. It came within about 3 % of the original 1500-iteration batch-4 schedule when started from a good (decoder-predicted) initialisation. From a **random** init (the default here), a longer schedule may be needed for full quality. That does not matter for speed work.
 
-## What was done (sections 1–3 and the A100 check: one A100 80 GB; sections 5–8 and 10: RTX 4090; section 9: A100 tuning)
+## What was done (sections 1–3 and the A100 check: one A100 80 GB; sections 5–8, 10 and 11: RTX 4090; section 9: A100 tuning; section 11: hybrid NCA + LPPN textures)
 
 ### 1. Batching NCAs on different targets
 
@@ -342,6 +359,96 @@ The review found a gap in the new alive-flip test: identifying flips solely from
 Also exercised the A100 paths on the 4090 with `-DNCA_FWD_TAIL=1 -DNCA_BWD_UNROLL=6 -DNCA_ADJ_CPT_GROWING=4 -DNCA_ADJ_ROWS_GROWING=2 -DNCA_BWD_HPARTS=1`, keeping the actual 100 KB memory limit. The strengthened suite passes, the same 120 comparisons remain bitwise equal, and Compute Sanitizer memcheck reports zero errors on 129×65 forward/backward/rollout cases including empty half-segments. This validates those code paths, not A100 performance; no A100 was available for this review. The installed extension was restored to the default 4090 build afterward.
 
 Local artifacts: `runs/perf-merge-4090/` (ignored), including both binaries, build and test logs, `paired-training.py` / `.json`, `compare.py` / `.json`, training configs/checkpoints, `quality-report.json`, and `quality-texture.png` / `quality-growing.png`.
+
+### 11. Hybrid NCA + LPPN textures (Cells2Pixels; RTX 4090, 2026-10-20 / 21)
+
+The Cells2Pixels texture model: per target a 16 / 128 NCA on a coarse grid (64² or 128²) and a small SIREN (32 hidden,
+2 hidden sine layers, sin(10 x)) that turns each cell's state and a sub-cell coordinate into RGB at S times the grid
+resolution, trained with the multi-scale OT appearance loss (VGG16 relu1_1 ... relu5_1 of the render at scale 0 and of
+2 / 4 random crops of 1/2 / 1/4 of it at scales 1 / 2, all resized to one patch size). `train_lppn.py` trains K
+targets together: the NCAs with the kernels of `ncaops/`, each with its own decoder and target (also targets that change
+at every batch: `MultiScaleOTLoss(target_mode='crops')`). The baseline was Cells2Pixels' own batched trainer
+(`batched/train.py` of its batched-lppn work: the UltraNCA NCA step, then decoder and loss per target with
+`torch.compile`). Measured on 8 NCAs x 4 samples per iteration, 48-step rollouts, three settings (render / VGG patch /
+NCA grid): A 1024 / 256 / 128 (x8), B 512 / 128 / 128 (x4), C 256 / 64 / 64 (x4).
+
+**Decoders (`lppn.py`, `ncaops/lppn_decoder.cuh`).** The bilinear weights of a pixel sum to one, so the state part of
+the first layer commutes with the interpolation: w0 (W [coord, bilerp(s)] + b) = bilerp(G) + T, with G = w0 (W_s s + b)
+per cell (a small matmul in PyTorch, whose autograd gives the state and W_s gradients) and T = w0 W_c coord a table
+over the S x S sub-cell positions. The kernel does the per-pixel rest: 4-tap interpolation, then 3 sines and the
+32 x 32 / 32 x 3 layers on fp16 tensor cores (mma.sync m16n8k16, fp32 accumulation), activations in registers; the
+backward recomputes the forward, scales dout per image by a power of two (fp16 range), and reduces every gradient in a
+fixed order (deterministic). Two decoders:
+- `mode: ensemble` (default): LIIF's local ensemble (Cells2Pixels `batched/decoder.LocalEnsembleSiren`): the SIREN at
+  the 4 nearest cells with the pixel's position relative to each, outputs blended with the bilinear weights. No seams
+  at cell borders; T has one table per corner.
+- `mode: lppn`: the original LPPN (`utils/render.Renderer2D` + `models/siren.Siren`: bilinear state, sub-cell
+  coordinate in [-1, 1) of the pixel's cell).
+- `jitter: true` (default; training only): each image samples the field at positions shifted by a random offset in
+  [-1/(2S), 1/(2S)) cells (interpolation weights and coordinates together; every pixel stays in its cell), so that the
+  decoder learns its coordinate input between the S x S training positions.
+Checks (`test_lppn.py`): both decoders match the fp32 references (which match Cells2Pixels' `Renderer2D` + `Siren` and
+`LocalEnsembleSiren` to 1e-7) within the error of the fp16 autocast that Cells2Pixels trains with (5e-4 to 1e-3), also
+with jitter and with output gradients of 1e-7; the backward is bitwise deterministic.
+
+Decoder forward + backward, 32 renders: Cells2Pixels (compiled, fp16 autocast) 198 / 36 / 15 ms (A / B / C), fused LPPN
+10.2 / 3.3 / 1.2 ms, fused local ensemble 27.7 / 7.4 / 1.7 ms.
+
+**Loss (`loss_ms.py`).** One VGG pass for all images and patches of a chunk (channels_last; chunks bounded in memory),
+the image gradient computed during the forward (the loss returns per-image values with an autograd node that scales the
+stored gradient), crops cut and resized by a Triton kernel with a deterministic backward, the OT terms batched over all
+patches per layer with the tiled REMD of `loss_triton.py`, and the per-chunk VGG + OT path `torch.compile`d. It
+matches Cells2Pixels' `AppearanceLoss` exactly when no sampling is involved (one scale, every position: values to 1e-6,
+image gradients to 6e-7) and statistically otherwise (`test_loss_ms.py`). Target modes:
+- `target_mode: whole` (the original): each patch against the whole target resized to patch * 2^s (cacheable for
+  fixed targets: 20 / 80 / 320 MB per target in C / B / A);
+- `target_mode: crops`: the target cut like the render; `pairing: pooled` (default) compares, per scale, the features
+  of all the render's crops with those of all the target's crops (both sides pooled), `paired` crop k with target
+  crop k. Only VGG at the patch size runs on the target, which suits targets that change at every batch;
+- `crops: [1, 2, 4]` (Cells2Pixels' int(2 s), the default) sets the number of crops per scale.
+
+`config_lppn.yml` defaults to setting C (64² NCA, 256² render) with a single-scale OT loss on the full render
+(`patch: 256, num_scales: 1`), the best configuration of the experiments below; Cells2Pixels' multi-scale loss is
+`num_scales: 3` with `patch` = `img_size` / 4.
+
+**Speed** (ms per iteration; the old trainer cached the whole-target features; new: LPPN decoder, the ensemble adds
+2–7 %):
+
+| setting | VGG | Cells2Pixels batched trainer | this repo | speedup |
+|---|---|---:|---:|---:|
+| A (1024 / 256 / 128) | fp32 / bf16 | 733 / 539 | 502 / 280 | 1.46x / 1.93x |
+| B (512 / 128 / 128) | fp32 / bf16 | 250 / 214 | 165 / 110 | 1.52x / 1.94x |
+| C (256 / 64 / 64) | fp32 / bf16 | 146 / 145 | 53 / 41 | 2.75x / 3.6x |
+
+At A the loss is at the cost of VGG itself (fp32: 14.3 ms per image against 14.0 for VGG alone), so VGG precision is
+the main remaining lever (bf16 VGG matched fp32 quality in a C training comparison, median loss ratio 0.998). With
+targets that change at every batch (32 NCAs x 1 sample, fp32 / bf16), crops (pooled) cost 664 / 340, 203 / 128 and
+64 / 45 ms in A / B / C, the whole target 989 / 510, 290 / 169 and 85 / 54 ms. End to end, 3000 iterations on 8 targets
+in C: 497 s with the Cells2Pixels trainer, 155 s here (whole target, fp32 VGG). The NCA rollout (33 / 12 ms for 128² /
+64² grids) is now 25–30 % of a C iteration.
+
+**Experiments** (setting C, 8 targets x 4 samples, 3000 iterations, fp32 VGG, two seeds; 8 PBR albedos and the 8
+Cells2Pixels `textures_hr` targets fire ... bubbles; scored by `eval_lppn.py`: 3 rollouts of 1024 steps per model, the
+multi-scale loss with the whole target (W) and with pooled crops (C), single-scale OT and Gram (Gatys) losses on the full
+render, the luminance contrast ratio σ and the cell-lattice imprint `grid` (0 = none). Figures and scores are local
+artifacts in `figures/`, ignored by git.)
+- Our trainer reproduces the Cells2Pixels trainer: median ratio of the W / C scores 1.01 / 1.01 and 1.02 / 1.02 for
+  two seeds, same contrast (`lppn_textures_quality`).
+- Pooled crops (both sides) against the whole target: single-scale OT 0.82–0.83x, Gram 0.34–0.40x (median per target),
+  contrast 0.93–0.95 instead of 0.86, every PBR target better on both; only the W score, the training loss of the
+  whole-target runs, prefers them (`lppn_pbr_whole_vs_pooled`, `lppn_textures_quality`).
+- One crop per scale (`crops: [1, 1, 1]`): 1.6–2.1x faster iterations (A / B / C), but single-scale OT 1.07–1.11x
+  and Gram 1.6–1.95x of the 1-2-4 pooled models (`lppn_*_crops124_vs_111`).
+- A single scale on the full 256² render (`patch: 256, num_scales: 1`): the best scores (Gram 0.40–0.57x of the pooled
+  models), 1.3x the training time in C; in A it would mean VGG on 1024² renders (`lppn_*_single256`).
+- Local ensemble against LPPN (single-scale loss): the same OT / Gram scores, a weaker cell lattice (grid 0.60–0.78
+  instead of 0.79–1.05) (`lppn_*_lppn_vs_ensemble`, with zoomed views).
+- Jitter: free; at the training scale the same scores and a weaker lattice for both decoders. Decoded at 64 -> 1024
+  (x16, 4x the training factor): the LPPN shows seams at every cell border (grid 1.0–1.45; on `textures_hr` its
+  single-scale OT is worse than bilinear upsampling of the x4 render), jitter reduces them; the local ensemble has none,
+  and with jitter its lattice is at the targets' level (grid -0.10 to 0.01, targets -0.07 / -0.17)
+  (`lppn_*_jitter_256`, `lppn_*_jitter_1024`). No variant creates detail finer than the training resolution (the
+  finest-band power at 1024 is 0–13 % of the target's).
 
 ## Planned next steps (in rough order of expected gain)
 

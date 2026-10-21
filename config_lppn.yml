@@ -1,0 +1,49 @@
+task: lppn                               # hybrid NCA + LPPN textures (train_lppn.py); the schedule of Cells2Pixels' configs/batched/texture8.yaml
+targets: data/pbr_textures               # directory of target images (prepare/download_pbr.py); relative paths are relative to this file
+names: [Abstract_009.jpg, Bark_007.jpg, Crystal_003.jpg, Honeycomb_002.jpg, Lava_005.jpg, Pebbles_025.jpg, Stone_Path_007.jpg,
+        Stylized_Grass_003.jpg]          # null: the first num_targets (sorted by name)
+num_targets: null
+out_dir: runs/lppn                       # <out_dir>/<name>/{model.pth, siren.pth}, <name>.png (target | render), log.json, config.yml
+img_size: 256                            # target and render resolution R; the decoder upsamples by R / nca.grid
+seed: 0
+preview_steps: 1024                      # rollout length of the saved renders
+log_every: 250
+
+nca:
+  channels: 16
+  hidden: 128
+  update_rate: 0.5
+  grid: 64                               # NCA grid (here x4 to the 256^2 render)
+
+lppn:                                    # decoder: models/siren.Siren (sin, num_frequencies 0, outermost linear) per cell
+  mode: ensemble                         # ensemble (LIIF local ensemble: the SIREN at the 4 nearest cells, outputs blended) | lppn (bilinear latent -> one SIREN call)
+  jitter: true                           # training only: shift each image's sample positions by U[-1/(2S), 1/(2S)) cells
+  hidden: 32                             # fixed by the kernels (ncaops/lppn_decoder.cuh)
+  layers: 2                              # hidden sine layers after the first (fixed by the kernels)
+  out: 3
+  first_omega: 10.0
+  hidden_omega: 10.0
+
+train:
+  group_size: 8                          # NCAs (targets) trained together
+  batch_size: 4                          # pool samples per NCA per iteration
+  iterations: 3000
+  pool_size: 512
+  lr: 1.0e-3
+  milestones: [1000, 2000]
+  gamma: 0.3
+  rollout: [24, 72]                      # rollout length drawn per iteration from [low, high)
+  inject_every: 32                       # the first sample of each NCA's batch restarts from the zero seed
+  appearance_weight: 2.0
+  overflow_weight: 100.0
+  tf32: true                             # TF32 NCA step and matmuls
+
+loss:                                    # loss_ms.py (Cells2Pixels AppearanceLoss, RGB)
+  patch: 256                             # VGG input size; scale s crops R / 2^s of the render
+  num_scales: 1                          # 1 with patch = img_size: one OT loss on the full render; Cells2Pixels: 3 with patch = img_size / 4
+  crops: null                            # crops per scale; null: 1, 2, 4 (Cells2Pixels: int(2 s)), e.g. [1, 1, 1]
+  n_samples: 1024
+  target_mode: whole                     # whole (the original: the target resized to patch * 2^s) | crops (cut like the render)
+  pairing: pooled                        # crops mode: pooled (all crops of a scale on both sides) | paired (crop k vs target crop k)
+  cache_targets: true                    # whole mode: target features once per group (fixed targets)
+  vgg_bf16: false                        # bf16 VGG (~2x faster loss; changes the loss precision)
