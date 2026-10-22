@@ -18,7 +18,7 @@ nca:
 lppn:                                    # decoder: models/siren.Siren (sin, num_frequencies 0, outermost linear) per cell
   mode: ensemble                         # ensemble (LIIF local ensemble: the SIREN at the 4 nearest cells, outputs blended) | lppn (bilinear latent -> one SIREN call)
   jitter: true                           # training only: shift each image's sample positions by U[-1/(2S), 1/(2S)) cells
-  hidden: 32                             # fixed by the kernels (ncaops/lppn_decoder.cuh)
+  hidden: 32                             # 32 or 24 (the widths the kernels are instantiated for, ncaops/lppn_cuda.cu)
   layers: 2                              # hidden sine layers after the first (fixed by the kernels)
   out: 3
   first_omega: 10.0
@@ -46,4 +46,6 @@ loss:                                    # loss_ms.py (Cells2Pixels AppearanceLo
   target_mode: whole                     # whole (the original: the target resized to patch * 2^s) | crops (cut like the render)
   pairing: pooled                        # crops mode: pooled (all crops of a scale on both sides) | paired (crop k vs target crop k)
   cache_targets: true                    # whole mode: target features once per group (fixed targets)
-  vgg_bf16: false                        # bf16 VGG (~2x faster loss; changes the loss precision)
+  vgg: torch                             # torch (torchvision VGG16) | cuda (ncaops/vgg_ops.py: fused CUTLASS kernels, fp16)
+  vgg_bf16: false                        # torch: bf16 autocast VGG (~2x faster loss; changes the loss precision)
+  vgg_acc16: false                       # cuda: fp16 accumulation in the convolutions (~1.75x faster on GeForce GPUs)

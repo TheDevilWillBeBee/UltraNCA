@@ -51,18 +51,21 @@ class _REMD(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, g):
-        x, y, nx, ny, i, j, x_side = ctx.saved_tensors
-        b, n, c = x.shape
+        return _remd_grad(g, *ctx.saved_tensors), None, None
 
-        def dsim(xp, nxp, yp, nyp):  # gradient of sim(x_p, y_p) w.r.t. x_p, for pairs p: (b, p, c)
-            d = nxp * nyp + 1e-10
-            dot = (xp * yp).sum(2)
-            return yp / d[..., None] - (dot * nyp / (nxp * d * d)).nan_to_num(0, 0, 0)[..., None] * xp
 
-        gx = -(g / n)[:, None, None] * dsim(x, nx, y.gather(1, j[..., None].expand(-1, -1, c)), ny.gather(1, j))
-        gy_side = -(g / y.shape[1])[:, None, None] * dsim(x.gather(1, i[..., None].expand(-1, -1, c)), nx.gather(1, i), y, ny)
-        gx = torch.where(x_side[:, None, None], gx, torch.zeros_like(gx).scatter_add_(1, i[..., None].expand(-1, -1, c), gy_side))
-        return gx, None, None
+def _remd_grad(g, x, y, nx, ny, i, j, x_side):
+    """Gradient w.r.t. x of _REMD for the output gradient g (b,), through the minimising pairs only."""
+    b, n, c = x.shape
+
+    def dsim(xp, nxp, yp, nyp):  # gradient of sim(x_p, y_p) w.r.t. x_p, for pairs p: (b, p, c)
+        d = nxp * nyp + 1e-10
+        dot = (xp * yp).sum(2)
+        return yp / d[..., None] - (dot * nyp / (nxp * d * d)).nan_to_num(0, 0, 0)[..., None] * xp
+
+    gx = -(g / n)[:, None, None] * dsim(x, nx, y.gather(1, j[..., None].expand(-1, -1, c)), ny.gather(1, j))
+    gy_side = -(g / y.shape[1])[:, None, None] * dsim(x.gather(1, i[..., None].expand(-1, -1, c)), nx.gather(1, i), y, ny)
+    return torch.where(x_side[:, None, None], gx, torch.zeros_like(gx).scatter_add_(1, i[..., None].expand(-1, -1, c), gy_side))
 
 
 def _moments(y):  # (b, n, c) -> mean (b, 1, c), covariance (b, c, c)

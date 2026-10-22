@@ -59,7 +59,8 @@ class Group:
         self.jitter = cfg['lppn'].get('jitter', False)  # random sample offsets per image, training only
         lc = cfg['loss']
         self.loss = MultiScaleOTLoss(lc['patch'], lc['num_scales'], lc['n_samples'], lc['target_mode'], lc['pairing'],
-                                     lc['vgg_bf16'], crops=lc.get('crops')).to(dev)
+                                     lc['vgg_bf16'], crops=lc.get('crops'), vgg=lc.get('vgg', 'torch'),
+                                     vgg_acc16=lc.get('vgg_acc16', False)).to(dev)
         self.targets = targets
         self.cache = self.loss.targets(targets) if lc['target_mode'] == 'whole' and lc['cache_targets'] else None
         g = torch.Generator().manual_seed(cfg['seed'])

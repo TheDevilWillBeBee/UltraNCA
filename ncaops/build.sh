@@ -20,5 +20,5 @@ grep -E "Compiling entry function|registers|spill" log | sed -E "s/.*function '(
   | awk '/lppn::/{sub(/\(.*/, ""); sub(/^void lppn::/, ""); name=$0} /spill stores/{spill=$5" "$9} /Used/{print $5" regs, spills "spill"  lppn::"name}' \
   | grep -E "lppn::(forward|backward)" || true
 if grep -q "error:" log; then exit 1; fi
-for f in nca_cuda.cpython-3*.so lppn_cuda.cpython-3*.so; do cp "$f" "../$f.tmp" && mv -f "../$f.tmp" "../$f"; done  # new inode: running processes keep theirs
+for f in nca_cuda.cpython-3*.so lppn_cuda.cpython-3*.so vgg_cuda.cpython-3*.so; do cp "$f" "../$f.tmp" && mv -f "../$f.tmp" "../$f"; done  # new inode: running processes keep theirs
 cd .. && rm -rf build

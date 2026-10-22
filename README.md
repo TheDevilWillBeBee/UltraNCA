@@ -19,7 +19,9 @@ Weights are saved in the vanilla format: `w1.weight` (96, 48, 1, 1), `w1.bias` (
 
 `train_lppn.py` trains the hybrid NCA + neural-field decoder textures of Cells2Pixels (a 16 / 128 NCA per target, a
 small SIREN decoding each cell to a higher-resolution image, and the multi-scale OT loss), with fused CUDA kernels for
-the decoder: see [section 11](#11-hybrid-nca--lppn-textures-cells2pixels-rtx-4090-2026-10-20--21).
+the decoder: see [section 11](#11-hybrid-nca--lppn-textures-cells2pixels-rtx-4090-2026-10-20--21). Its OT loss can run on a
+fused VGG16 (`ncaops/vgg_ops.py`, also usable on its own: the relu maps, sampled features, gradient to the images):
+see [section 12](#12-fused-vgg16-for-the-ot-loss-rtx-4090-2026-10-22).
 
 ## Quick start
 
@@ -36,6 +38,8 @@ python ncaops/testing/test_lppn.py     # fused decoder kernels vs PyTorch (+ Cel
 python ncaops/testing/test_loss_ms.py  # multi-scale OT loss vs Cells2Pixels' AppearanceLoss (needs ../Cells2Pixels or $C2P)
 python train_lppn.py                   # config_lppn.yml -> runs/lppn/<texture>/{model.pth, siren.pth}, <texture>.png, log.json
 python benchmark_lppn.py --settings A B C --modes whole crops
+python ncaops/testing/test_vgg.py --bench  # fused VGG16 vs torchvision (bash ncaops/build.sh fetches CUTLASS headers once)
+python benchmark_vgg.py --N 32 128         # single-scale OT loss at 256²: eager / compile / current / fused VGG
 ```
 
 ## Files
@@ -58,10 +62,12 @@ python benchmark_lppn.py --settings A B C --modes whole crops
 | `benchmark.py` | steady-state cost per training iteration (`train`) and of no-grad rollouts (`infer`) vs K and `impl` |
 | `prepare/download_pbr.py` | PBR dataset download (same source as Cells2Pixels), albedo maps only |
 | `prepare/download_emoji.py` | 64 Noto emojis (v2.047) for the growing task |
-| `config_lppn.yml` | hybrid NCA + decoder textures (Cells2Pixels): targets, render size, NCA, decoder (`mode`, `jitter`), schedule, loss (`target_mode`, `pairing`, `crops`, `vgg_bf16`) |
+| `config_lppn.yml` | hybrid NCA + decoder textures (Cells2Pixels): targets, render size, NCA, decoder (`mode`, `jitter`), schedule, loss (`target_mode`, `pairing`, `crops`, `vgg`, `vgg_bf16`, `vgg_acc16`) |
 | `train_lppn.py` | its training loop: K NCAs x B samples, one decoder per NCA; checkpoints in the Cells2Pixels format |
 | `lppn.py` | the decoders: local ensemble (default) and LPPN, their PyTorch references, the per-cell / per-position decomposition, jitter, Cells2Pixels state_dict conversion |
-| `loss_ms.py` | multi-scale OT appearance loss of Cells2Pixels for N images with their own targets: whole target or target crops (pooled / paired), crops per scale, chunked VGG with the image gradient computed in the forward |
+| `loss_ms.py` | multi-scale OT appearance loss of Cells2Pixels for N images with their own targets: whole target or target crops (pooled / paired), crops per scale, chunked VGG with the image gradient computed in the forward; torchvision or fused VGG (`vgg='cuda'`) |
+| `ncaops/vgg_cuda.cu`, `ncaops/vgg_ops.py` | fused VGG16 relu1_1 … relu5_1 (CUTLASS convolutions with bias + relu / relu-mask epilogues, fp16, pooling, sampled-feature gather / scatter; module `vgg_cuda`) and its autograd module `VGG16Features`: the 5 relu maps, optional features at given positions, gradient to the images |
+| `ncaops/testing/test_vgg.py`, `benchmark_vgg.py` | fused VGG vs torchvision (features, image gradients; `--bench`); cost of the single-scale OT loss at 256² per implementation and batch size |
 | `ncaops/lppn_decoder.cuh`, `ncaops/lppn_cuda.cu`, `ncaops/lppn_ops.py` | fused decoder kernels (forward, backward, reductions), bindings (module `lppn_cuda`), autograd wrapper |
 | `ncaops/testing/test_lppn.py`, `ncaops/testing/test_loss_ms.py` | correctness tests (and `--bench`) of the decoder kernels and the multi-scale loss |
 | `benchmark_lppn.py` | cost of one hybrid training iteration and its parts per setting, VGG precision, target mode and decoder |
@@ -77,7 +83,7 @@ Default schedule (`config.yml`):
 
 This is the batch-2 point of a batch-size study at a fixed sample budget. It came within about 3 % of the original 1500-iteration batch-4 schedule when started from a good (decoder-predicted) initialisation. From a **random** init (the default here), a longer schedule may be needed for full quality. That does not matter for speed work.
 
-## What was done (sections 1–3 and the A100 check: one A100 80 GB; sections 5–8, 10 and 11: RTX 4090; section 9: A100 tuning; section 11: hybrid NCA + LPPN textures)
+## What was done (sections 1–3 and the A100 check: one A100 80 GB; sections 5–8, 10–12: RTX 4090; section 9: A100 tuning; section 11: hybrid NCA + LPPN textures; section 12: fused VGG16 for the OT loss)
 
 ### 1. Batching NCAs on different targets
 
@@ -384,6 +390,9 @@ fixed order (deterministic). Two decoders:
   at cell borders; T has one table per corner.
 - `mode: lppn`: the original LPPN (`utils/render.Renderer2D` + `models/siren.Siren`: bilinear state, sub-cell
   coordinate in [-1, 1) of the pixel's cell).
+- `hidden: 32` or `24`: the decoder width (kernels instantiated for both; 24 runs the second k-step of the matmuls
+  half-filled). Decoder forward + backward, 32 renders, 32 -> 24: local ensemble 28.7 -> 22.4 / 7.4 -> 6.3 / 1.8 ->
+  1.6 ms (A / B / C), LPPN 10.1 -> 9.4 / 3.3 -> 2.9 / 1.25 -> 1.25 ms.
 - `jitter: true` (default; training only): each image samples the field at positions shifted by a random offset in
   [-1/(2S), 1/(2S)) cells (interpolation weights and coordinates together; every pixel stays in its cell), so that the
   decoder learns its coordinate input between the S x S training positions.
@@ -450,10 +459,96 @@ artifacts in `figures/`, ignored by git.)
   (`lppn_*_jitter_256`, `lppn_*_jitter_1024`). No variant creates detail finer than the training resolution (the
   finest-band power at 1024 is 0–13 % of the target's).
 
+### 12. Fused VGG16 for the OT loss (RTX 4090, 2026-10-22)
+
+The default loss of section 11, a single-scale OT loss at 256², is one VGG16 forward of each render and of its target
+up to relu5_1, the OT terms on 1024 positions per layer, and the VGG backward to the render. `ncaops/vgg_cuda.cu` and
+`ncaops/vgg_ops.py` replace torchvision's VGG for it (`MultiScaleOTLoss(vgg='cuda')`, `loss.vgg: cuda` in
+`config_lppn.yml`; every target mode and crop setting):
+- **Convolutions**: CUTLASS 2.x implicit GEMMs (sm_80 `mma.sync`, NHWC, fp16 operands; CUTLASS v4.2.1 headers, fetched
+  by CMake into `ncaops/third_party/`) whose epilogues do the rest of the layer: bias + relu in the forward, the relu
+  mask of the forward activation in the backward (no bias, relu or relu-backward pass over the activations). Three
+  tile shapes per layer, the fastest picked by timing once. conv1_1 and its input gradient (3 channels, memory-bound)
+  are CUDA-core kernels in fp32 that read the RGB input and write the image gradient directly (1.4 / 1.3 ms for 128
+  images of 256², against 2.1 + 0.5 / 2.4 + 0.4 ms as 8-channel CUTLASS convolutions with padding and slicing
+  passes).
+- **Accumulation**: fp32 (default) or fp16 (`vgg_acc16` / `VGG16Features('fp16')`). GeForce tensor cores run fp16
+  accumulation at twice the fp32-accumulation rate (A100 / H100: the same rate, no gain): the convolutions run at
+  ~175 TFLOPS with fp32 accumulation (the RTX 4090's limit) and ~270 with fp16 (fprop 27.9 -> 15.9 ms, dgrad 28.5 ->
+  16.3 ms for the 10 3x3 convolutions after conv1_1, 128 images).
+- **Backward in fp16**: each image's gradients carry a power-of-2 scale that puts its largest incoming feature gradient
+  at 2^8 .. 2^9 (measured on OT gradients, the per-layer maxima then stay within 2^±3 of it), removed from the fp32
+  image gradient.
+- **Pooling** keeps a 1-byte argmax, only when a backward follows; the backward unpools from it (the pre-pool
+  activations are not kept).
+- **Sampled positions**: the loss draws its 1024 positions per layer before VGG runs; VGG gathers the features there
+  (fp32) and its backward scatters their gradients, relu-masked, straight into the layer gradient: no dense, mostly
+  zero feature-map gradient. Layers with at most 1024 positions (relu4_1, relu5_1 at 256²) are gathered whole, so that
+  their gradients also stay fp32 until VGG scales them (fp16 map gradients would lose the small ones).
+- **OT terms on fp16 tensor cores** (`loss_ms._OT16`, `loss_triton.cov_l1` / `cov_l1_grad`): the features are fp16
+  values, so fp16 products with fp32 accumulation are exact. The covariance term computes vᵀv - n mᵀm per tile of the
+  upper triangle and keeps only the per-tile sums of |cov(x) - cov(y)| and the int8 signs (no covariance matrix
+  stored, no centred copy); its backward is one GEMM (x - m) · sign that also adds the mean-term and relaxed-EMD
+  gradients; the relaxed EMD's nearest pairs use fp16 products. The OT stage at 128 images: 23 -> 12 ms; against
+  float64 the values agree to 4e-6 and the gradients to 2e-4 – 4e-3 (the TF32 path: 3e-4 – 1.4e-2).
+- **The relu maps stay available** for other uses: `VGG16Features()(images)` returns relu1_1 ... relu5_1 (fp16,
+  (N, C, h, w) views of channels-last maps), differentiable; with `positions=` also the features at given positions
+  (per image, or `flat=True` rows of the whole batch, e.g. crops pooled per image). Gradients from maps and samples in
+  any combination; layers above the highest one with a gradient are skipped in the backward.
+
+Accuracy against torchvision fp32 (`test_vgg.py`, `test_loss_ms.py`; 8 PBR albedos at 256²; image gradient from
+random gradients at 1024 sampled positions per layer):
+
+| VGG | features, max error / max (relu1_1 ... relu5_1) | image gradient, relative L2 error |
+|---|---|---:|
+| torchvision TF32 | 0 – 4.6e-4 | 5.6 % |
+| torchvision bf16 autocast | 4.6e-3 – 1.1e-2 | 26 % |
+| fused, fp32 accumulation | 3.1e-4 – 5.1e-4 | 6.5 % |
+| fused, fp16 accumulation | 3.1e-4 – 5.1e-3 | 13 % |
+
+The image-gradient errors come from relu and max-pooling decisions flipped by the forward's rounding (storing the
+gradients in fp16 instead of bf16 changed none of them). The loss itself with every position used: 3e-5 (fp32
+accumulation) / 3e-4 (fp16) relative to fp32, image gradients 3.4 / 7.1 % (relative L2); with sampling, every target
+mode matches the torchvision loss within the noise of the samples.
+
+**Speed** (`benchmark_vgg.py`: single-scale OT loss at 256², 1024 samples per layer, forward + backward to the images,
+ms; the target features computed at every call, one target per image; eager / compile: plain PyTorch, torchvision VGG
+NCHW and the Cells2Pixels OT terms, chunks of 32 images, `torch.compile()` with default options; current: `loss_ms.py`
+of section 11; fp32 = TF32 convolutions):
+
+| N | eager fp32 | compile fp32 | current fp32 | eager bf16 | compile bf16 | current bf16 | fused | fused fp16 acc. |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 8 | 30.5 | 22.9 | 20.9 | 21.0 | 13.0 | 10.8 | 7.9 | 6.1 |
+| 16 | 65.3 | 47.2 | 41.6 | 46.1 | 25.6 | 20.3 | 14.8 | 10.9 |
+| 32 | 135.8 | 96.6 | 86.4 | 98.7 | 52.3 | 42.3 | 28.4 | 21.0 |
+| 64 | 272.4 | 195.2 | 168.8 | 195.3 | 104.7 | 82.6 | 57.6 | 39.7 |
+| 128 | 545.7 | 388.0 | 338.0 | 391.5 | 210.3 | 164.5 | 115.1 | 80.8 |
+
+At 128 images the fused VGG with fp16 accumulation is 2.6x faster than `torch.compile` in bf16 (4.8x than in fp32),
+2.0x faster than the current loss in bf16 and 4.2x than in fp32 (the training default); the fused VGG with fp32
+accumulation is 1.4x / 2.9x faster than the current loss in bf16 / fp32. The cost per image is flat from 16 images on.
+With the target features cached (8 fixed targets, `--cached`), 128 images: current 245 / 126 ms (fp32 / bf16), fused
+85 / 63 ms (fp32 / fp16 accumulation). Peak memory 6.2 GB (`chunk_gb: 6`: chunks of 100 images). Of the 81 ms:
+convolutions 58 (target forward, render forward, backward), OT terms ~12, pooling / unpooling 9.6, gather / scatter
+2.6. (A first version, without the CUDA-core first layer, the fp16 OT terms and fp32 gradients for the whole-map layers:
+127 / 98 ms.)
+
+VGG alone (forward / forward + backward with gradients on all 5 maps, 128 images of 256², ms; `test_vgg.py --bench`):
+fused 31 / 80 (fp32 accumulation), 21 / 57 (fp16); torchvision bf16 autocast, channels_last 58 / 119 eager, 44 / 91
+compiled.
+
+**Training** (config C defaults, single-scale loss, 8 targets x 4 samples, 3000 iterations, two seeds, PBR albedos and
+`textures_hr`): 215 s with the torchvision fp32 VGG, 85 s fused with fp16 accumulation (the first version: 107 s with
+fp32, 94 s with fp16 accumulation). Scores (`eval_lppn.py`, judged with torchvision fp32), per-target median ratios
+to the first torchvision seed: fused 0.99 – 1.02 for the OT judges (W, C, single-scale OT) and 1.01 – 1.28 for Gram,
+against 1.00 – 1.04 / 1.06 – 1.10 for the second torchvision seed (the first fused version: 0.99 – 1.04 /
+1.05 – 1.19); the occasional failed target (OT judge 1.3 – 2.3x) appears with either VGG (torchvision 2, first fused
+version 3 of 64 target runs; none in the 32 of the current one). `config_lppn.yml` keeps `vgg: torch` as the default.
+
 ## Planned next steps (in rough order of expected gain)
 
 1. **Backward occupancy / latency**: 255 registers and ~47 KB of shared memory per 4-warp block give 8 warps per SM, and the kernel issues every 9 cycles per warp (stalls: tensor pipe 2.4, weight-fragment loads 2.0, dependencies 1.7, barriers 1.6 cycles per instruction). On the A100 / H100 (164 / 228 KB), an 8-warp block of two 4-warp teams with the weight fragments resident in shared memory (~140 KB) would remove the fragment-load stalls; it does not fit 100 KB. Tried and dropped: two warps per pixel group (8-warp blocks at 128 registers, 16 warps per SM): twice the instructions per MMA, 15–30 % slower; a 168-register cap (spills). A100 (section 9): the fragment loads cost 132 of 688 µs but are not L1 misses (a 28 KB L1 costs 3.5 %), so shared-memory residency would save little; the 168-register cap with 3 blocks per SM is 12 % slower.
 2. **Fusing the adjoint** stays a loss on 100 KB GPUs (see above); with 164 KB or more, the gather could stage a tile's dp in shared memory instead of reading it 9 times from L2. A100 (section 9): a standalone adjoint that stages the patch's records in shared memory was no faster (the kernel is latency- and occupancy-bound), and the fused version would also recompute the halo rows.
-3. **OT loss**: sections 7–8 reduce pooling and REMD traffic. The remaining loss cost is mostly frozen VGG convolutions and their backward; the cuDNN TF32 conversion passes alone take about 3.4 ms for 64 images. The gradient of the 1024 sampled feature positions still materializes a dense scatter (~1 ms). bf16 VGG remains a validated opt-in.
+3. **OT loss**: sections 7–8 reduce pooling and REMD traffic; section 12 replaces VGG by fused kernels whose convolutions run at the tensor-core limit and moves the OT terms to fp16 tensor cores. What remains at 128 images of 256² (fused, fp16 accumulation, 81 ms): the convolutions (58 ms; Winograd F(2x2, 3x3) would do 2.25x fewer multiplies, at some cost in fp16 accuracy), pooling / unpooling as separate passes (~10 ms: fusing pooling into the convolution epilogue needs tiles that cover two image rows), the relaxed-EMD backward (~4 ms of compiled gathers and a scatter; its x side could join the covariance-gradient epilogue). On A100 / H100 fp16 accumulation gains nothing (fp32 accumulation already runs at the full tensor rate there); H100 would need `wgmma` kernels (CUTLASS 3.x) to reach its peak.
 4. **Sparse growing grids**: redundant clearing and alive-mask scans are removed in section 7; the forward still scans all strips for living cells. Tracking active tiles could reduce this remaining cost on very large, mostly empty grids.
 5. **Other GPUs**: H100 `wgmma`; other (C, HID) instantiations (`dispatch()` in `nca_cuda.cu`; C a multiple of 4, HID a multiple of 32).

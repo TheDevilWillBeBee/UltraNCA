@@ -2,7 +2,9 @@
 (1) one scale with every feature position used (no sampling): values and image gradients equal to fp32 rounding;
 (2) the patch builder (windows, 2 x 2 means, normalisation) and its backward against F.interpolate + autograd;
 (3) the full loss (3 scales, 1024 samples, whole target) against AppearanceLoss over seeds (statistical);
-(4) the crops modes run, their gradients are deterministic in the builder and finite.
+(4) the crops modes run, their gradients are deterministic in the builder and finite;
+(5) vgg='cuda' (ncaops/vgg_ops.py, both accumulations) against vgg='torch' in fp32: every position used: loss and
+image gradient within the fp16 / bf16 error; with sampling, every mode: the mean over seeds within the noise.
 python ncaops/testing/test_loss_ms.py [--bench]
 """
 import os, sys, argparse, time
@@ -109,6 +111,52 @@ def modes(path):
     cache(img, cache=c)
 
 
+def cuda_vgg(path, seeds=8):
+    from PIL import Image
+    import numpy as np
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    R, P = 256, 64
+    t = torch.from_numpy(np.array(Image.open(path).convert('RGB').resize((R, R), Image.BICUBIC))).permute(2, 0, 1).float().div(255)
+    target = t[None].repeat(3, 1, 1, 1).to(dev)
+    torch.manual_seed(0)
+    img = (target.roll(37, 2) * 0.8 + 0.1 * torch.rand_like(target))
+    img[1] = torch.rand_like(img[1])
+    grads = {}
+    for name, kw in (('torch', {}), ('cuda', dict(vgg='cuda')), ('cuda acc16', dict(vgg='cuda', vgg_acc16=True))):
+        m = MultiScaleOTLoss(patch=P, num_scales=1, n_samples=10 ** 6, **kw).to(dev)  # every position: no sampling
+        x = img.clone().requires_grad_()
+        loss = m(x, target)
+        loss.sum().backward()
+        grads[name] = (loss.detach(), x.grad)
+    lr, gr = grads['torch']
+    for name in ('cuda', 'cuda acc16'):
+        l, g = grads[name]
+        el, eg = ((l - lr).abs() / lr).max().item(), ((g - gr).norm() / gr.norm()).item()
+        print(f'(5) {name:10s}, one scale, all positions: loss rel. diff {el:.1e}, image gradient rel. L2 diff {eg:.1e}')
+        assert el < 1e-2 and eg < 0.2
+    torch.backends.cudnn.allow_tf32 = True
+    for mode, pairing in (('whole', 'pooled'), ('crops', 'pooled'), ('crops', 'paired')):
+        vals = {}
+        for name, kw in (('torch', {}), ('cuda', dict(vgg='cuda'))):
+            torch._dynamo.reset()
+            m = MultiScaleOTLoss(patch=P, num_scales=3, target_mode=mode, pairing=pairing, **kw).to(dev)
+            v = []
+            for s in range(seeds):
+                torch.manual_seed(s)
+                x = img.clone().requires_grad_()
+                loss = m(x, target)
+                loss.sum().backward()
+                assert torch.isfinite(x.grad).all()
+                v.append(loss.detach())
+            vals[name] = torch.stack(v)  # (seeds, images)
+        a, b = vals['torch'], vals['cuda']
+        tol = 3 * (a.var(0) / seeds + b.var(0) / seeds).sqrt() + 1e-2 * a.mean(0)
+        print(f'(5) {mode:5s} {pairing:6s} 3 scales, sampled: torch {a.mean(0).tolist()} vs cuda {b.mean(0).tolist()} '
+              f'(tolerance {tol.tolist()})')
+        assert ((a.mean(0) - b.mean(0)).abs() < tol).all()
+
+
 def bench():
     from PIL import Image  # noqa: F401
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -150,6 +198,7 @@ if __name__ == '__main__':
     builder()
     statistical(path)
     modes(path)
+    cuda_vgg(path)
     print('all multi-scale loss checks passed')
     if a.bench:
         bench()

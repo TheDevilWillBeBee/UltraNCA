@@ -1,5 +1,9 @@
-"""Tiled relaxed-EMD nearest pairs for the compiled texture loss (TF32 or 3xTF32).
-Only row/column maxima and their indices leave each tile; no dense similarity matrix is stored.
+"""Triton kernels of the compiled texture loss.
+- nearest: tiled relaxed-EMD nearest pairs (TF32 or 3xTF32; fp16 for fp16-valued features, exact). Only row/column
+  maxima and their indices leave each tile; no dense similarity matrix is stored.
+- cov_l1, cov_l1_grad: the covariance term mean |cov(x) - cov(y)| of fp16-valued features and its gradient, on fp16
+  tensor cores with fp32 accumulation (exact products): cov = (v^T v - n m^T m) / (n - 1), per tile of the upper
+  triangle, only the per-tile sums of |cov(x) - cov(y)| and the int8 signs leave the kernel.
 """
 import torch
 import triton
@@ -27,10 +31,13 @@ def _pairs(X, Y, NX, NY, PX, IX, PY, IY, N: tl.constexpr, M: tl.constexpr, C: tl
         cc = k * BK + kk
         x = tl.load(X + b * X0 + ii[:, None] * X1 + cc[None, :] * X2, (ii[:, None] < N) & (cc[None, :] < C), 0)
         y = tl.load(Y + b * Y0 + jj[None, :] * Y1 + cc[:, None] * Y2, (jj[None, :] < M) & (cc[:, None] < C), 0)
-        if PREC == 'tf32':  # match cuBLAS rounding; Triton's default TF32 conversion truncates
-            x = tl.inline_asm_elementwise('cvt.rna.tf32.f32 $0, $1;', constraints='=f,f', args=[x], dtype=tl.float32, is_pure=True, pack=1)
-            y = tl.inline_asm_elementwise('cvt.rna.tf32.f32 $0, $1;', constraints='=f,f', args=[y], dtype=tl.float32, is_pure=True, pack=1)
-        acc = tl.dot(x, y, acc, input_precision=PREC)
+        if PREC == 'fp16':  # fp16-valued inputs: exact products
+            acc = tl.dot(x.to(tl.float16), y.to(tl.float16), acc)
+        else:
+            if PREC == 'tf32':  # match cuBLAS rounding; Triton's default TF32 conversion truncates
+                x = tl.inline_asm_elementwise('cvt.rna.tf32.f32 $0, $1;', constraints='=f,f', args=[x], dtype=tl.float32, is_pure=True, pack=1)
+                y = tl.inline_asm_elementwise('cvt.rna.tf32.f32 $0, $1;', constraints='=f,f', args=[y], dtype=tl.float32, is_pure=True, pack=1)
+            acc = tl.dot(x, y, acc, input_precision=PREC)
     nx = tl.load(NX + b * NX0 + ii * NX1, ii < N, 0)
     ny = tl.load(NY + b * NY0 + jj * NY1, jj < M, 0)
     sim = acc / (nx[:, None] * ny[None, :] + 1.e-10)
@@ -44,14 +51,15 @@ def _pairs(X, Y, NX, NY, PX, IX, PY, IY, N: tl.constexpr, M: tl.constexpr, C: tl
 
 
 @triton_op('ultranca::remd_nearest', mutates_args={})
-def nearest(x: torch.Tensor, y: torch.Tensor, nx: torch.Tensor, ny: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def nearest(x: torch.Tensor, y: torch.Tensor, nx: torch.Tensor, ny: torch.Tensor, fp16: bool = False) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """fp16: x and y hold fp16 values (any float dtype): fp16 products, exact."""
     b, n, c = x.shape
     m = y.shape[1]
-    bm, bn, bk = 64, 64, 32
-    px = torch.empty((b, triton.cdiv(m, bn), n), dtype=x.dtype, device=x.device)
-    py = torch.empty((b, triton.cdiv(n, bm), m), dtype=x.dtype, device=x.device)
+    bm, bn, bk = (64, 128, 32) if fp16 else (64, 64, 32)
+    px = torch.empty((b, triton.cdiv(m, bn), n), dtype=torch.float32, device=x.device)
+    py = torch.empty((b, triton.cdiv(n, bm), m), dtype=torch.float32, device=x.device)
     ix, iy = torch.empty_like(px, dtype=torch.int32), torch.empty_like(py, dtype=torch.int32)
-    prec = 'tf32' if torch.backends.cuda.matmul.allow_tf32 else 'tf32x3'
+    prec = 'fp16' if fp16 else 'tf32' if torch.backends.cuda.matmul.allow_tf32 else 'tf32x3'
     wrap_triton(_pairs)[(triton.cdiv(n, bm), triton.cdiv(m, bn), b)](
         x, y, nx, ny, px, ix, py, iy, n, m, c, *x.stride(), *y.stride(), *nx.stride(), *ny.stride(),
         bm, bn, bk, prec, num_warps=4, enable_fp_fusion=False)
@@ -59,3 +67,81 @@ def nearest(x: torch.Tensor, y: torch.Tensor, nx: torch.Tensor, ny: torch.Tensor
     j = ix.gather(1, sx[:, None, :]).squeeze(1).long()
     i = iy.gather(1, sy[:, None, :]).squeeze(1).long()
     return vx, j, vy, i
+
+
+@triton.jit
+def _cov_fwd(X, Y, MX, MY, TI, TJ, S, PART, n, m, T, C: tl.constexpr, X0, X1, Y0, Y1,
+             BC: tl.constexpr, BK: tl.constexpr):
+    """Tile (TI[t], TJ[t]) of the upper triangle of item b: d = cov(x) - cov(y) -> sign(d) (int8, both triangles),
+    sum |d| (doubled off the diagonal)."""
+    t, b = tl.program_id(0), tl.program_id(1)
+    ti, tj = tl.load(TI + t), tl.load(TJ + t)
+    ci, cj, kk = ti * BC + tl.arange(0, BC), tj * BC + tl.arange(0, BC), tl.arange(0, BK)
+    ax = tl.zeros((BC, BC), tl.float32)
+    for k in range(0, n, BK):
+        r = (k + kk)[:, None]
+        a = tl.load(X + b * X0 + r * X1 + ci[None, :], r < n, 0).to(tl.float16)
+        v = tl.load(X + b * X0 + r * X1 + cj[None, :], r < n, 0).to(tl.float16)
+        ax = tl.dot(tl.trans(a), v, ax)
+    ay = tl.zeros((BC, BC), tl.float32)
+    for k in range(0, m, BK):
+        r = (k + kk)[:, None]
+        a = tl.load(Y + b * Y0 + r * Y1 + ci[None, :], r < m, 0).to(tl.float16)
+        v = tl.load(Y + b * Y0 + r * Y1 + cj[None, :], r < m, 0).to(tl.float16)
+        ay = tl.dot(tl.trans(a), v, ay)
+    mxi, mxj = tl.load(MX + b * C + ci), tl.load(MX + b * C + cj)
+    myi, myj = tl.load(MY + b * C + ci), tl.load(MY + b * C + cj)
+    d = (ax - n * mxi[:, None] * mxj[None, :]) / (n - 1) - (ay - m * myi[:, None] * myj[None, :]) / (m - 1)
+    s = tl.where(d > 0, 1, tl.where(d < 0, -1, 0)).to(tl.int8)
+    tl.store(S + b * C * C + ci[:, None] * C + cj[None, :], s)
+    tl.store(S + b * C * C + cj[None, :] * C + ci[:, None], s)
+    tl.store(PART + b * T + t, tl.sum(tl.abs(d)) * tl.where(ti == tj, 1.0, 2.0))
+
+
+@triton_op('ultranca::cov_l1', mutates_args={})
+def cov_l1(x: torch.Tensor, y: torch.Tensor, mx: torch.Tensor, my: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """mean |cov(x) - cov(y)| per item of fp16-valued x (b, n, c), y (b, m, c) (any float dtype, unit channel stride)
+    with means mx, my (b, c) fp32 -> (b,), and sign(cov(x) - cov(y)) (b, c, c) int8."""
+    b, n, c = x.shape
+    m = y.shape[1]
+    assert c % 64 == 0 and n > 1 and m > 1 and x.stride(2) == 1 and y.stride(2) == 1
+    bc = 128 if c % 128 == 0 else 64
+    tiles = c // bc
+    ti, tj = torch.triu_indices(tiles, tiles, device=x.device).int()
+    part = torch.empty(b, len(ti), device=x.device)
+    sign = torch.empty(b, c, c, device=x.device, dtype=torch.int8)
+    wrap_triton(_cov_fwd)[(len(ti), b)](x, y, mx, my, ti, tj, sign, part, n, m, len(ti), c, x.stride(0), x.stride(1),
+                                         y.stride(0), y.stride(1), bc, 32, num_warps=bc // 16, num_stages=3)
+    return part.sum(1) / (c * c), sign
+
+
+@triton.jit
+def _cov_bwd(X, MX, S, COEF, VEC, R, OUT, n, C: tl.constexpr, X0, X1, BM: tl.constexpr, BN: tl.constexpr,
+             BK: tl.constexpr):
+    """OUT = R + COEF[b] (x - mx) S + VEC[b] (rows broadcast), for an (BM, BN) tile of item b; OUT, R contiguous."""
+    im, jn, b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    rows, cols, kk = im * BM + tl.arange(0, BM), jn * BN + tl.arange(0, BN), tl.arange(0, BK)
+    acc = tl.zeros((BM, BN), tl.float32)
+    for k in range(0, C, BK):
+        a = tl.load(X + b * X0 + rows[:, None] * X1 + (k + kk)[None, :], rows[:, None] < n, 0).to(tl.float32)
+        a = (a - tl.load(MX + b * C + k + kk)[None, :]).to(tl.float16)
+        s = tl.load(S + b * C * C + (k + kk)[:, None] * C + cols[None, :]).to(tl.float16)
+        acc = tl.dot(a, s, acc)
+    o = b * n * C + rows[:, None] * C + cols[None, :]
+    r = tl.load(R + o, rows[:, None] < n, 0)
+    out = r + tl.load(COEF + b) * acc + tl.load(VEC + b * C + cols)[None, :]
+    tl.store(OUT + o, out, rows[:, None] < n)
+
+
+@triton_op('ultranca::cov_l1_grad', mutates_args={})
+def cov_l1_grad(x: torch.Tensor, mx: torch.Tensor, sign: torch.Tensor, coef: torch.Tensor, vec: torch.Tensor,
+                r: torch.Tensor) -> torch.Tensor:
+    """r + coef[b] (x - mx) sign + vec[b] per item: the covariance-term gradient (coef = g 2 / (c^2 (n - 1))) added to
+    the other terms' gradients r (b, n, c) fp32 contiguous and vec (b, c)."""
+    b, n, c = x.shape
+    assert c % 64 == 0 and x.stride(2) == 1 and r.is_contiguous()
+    bm, bn, bk = 64, 64, 32
+    out = torch.empty_like(r)
+    wrap_triton(_cov_bwd)[(triton.cdiv(n, bm), c // bn, b)](x, mx, sign, coef, vec, r, out, n, c, x.stride(0), x.stride(1),
+                                                            bm, bn, bk, num_warps=4)
+    return out
