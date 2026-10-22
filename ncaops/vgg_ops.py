@@ -2,6 +2,7 @@
 vgg_cuda.cu (built by build.sh): fp16 NHWC activations and gradients, CUTLASS convolutions whose epilogues apply bias +
 relu in the forward and the relu mask in the backward, max pooling with a 1-byte argmax. Differentiable w.r.t. the
 images.
+Backward unpooling is fused into the preceding convolution's output stores.
 
     vgg = VGG16Features(accumulate='fp32').cuda()
     maps = vgg(images)                      # images (N, 3, H, W) in [0, 1], fp32, H and W multiples of 16
@@ -27,13 +28,16 @@ GeForce cards, whose tensor cores run fp16 accumulation at twice the fp32-accumu
 fp16 holds the activations of [0, 1] images with a wide margin (VGG16's relu maps stay below ~10^3; fp16 overflows at
 65504). The backward scales each image's gradients by a power of 2 that puts the largest incoming feature gradient of
 the image at 2^8 .. 2^9 (they then stay within a few powers of 2 of it through the layers), and unscales the image
-gradient (fp32).
+gradient (fp32). A Triton reduction finds the sampled-gradient maxima directly per image, without intermediate
+row norms or scatter-index tensors.
 conv1_1 (3 input channels) and its input gradient run on CUDA cores in fp32 (memory-bound: 64 channels written or read
 per pixel). Each other convolution uses the fastest of three tile shapes for its problem size, measured once
 (VGG16Features.tiles).
 """
 import torch
 import torchvision
+import triton
+import triton.language as tl
 
 try:
     from . import vgg_cuda
@@ -46,6 +50,31 @@ _G_TYPE = {torch.float32: 0, torch.float16: 1, torch.bfloat16: 2}
 
 def _stream():
     return torch.cuda.current_stream().cuda_stream
+
+
+@triton.jit
+def _sample_amax(G, ROWS, AMAX, R: tl.constexpr, C: tl.constexpr, M: tl.constexpr,
+                 BR: tl.constexpr, BC: tl.constexpr):
+    """Reduce sampled gradients straight to their images, avoiding row norms and scatter indices in memory."""
+    r, c = tl.program_id(0) * BR + tl.arange(0, BR), tl.arange(0, BC)
+    image = tl.load(ROWS + r, r < R, 0) // M
+    g = tl.load(G + r[:, None] * C + c[None, :], (r[:, None] < R) & (c[None, :] < C), 0).to(tl.float32)
+    # Positive float bit patterns are ordered, including NaNs above infinity: integer max preserves NaNs.
+    vmax = tl.max(tl.abs(g).to(tl.uint32, bitcast=True), 1)
+    dst = AMAX.to(tl.pointer_type(tl.uint32))
+    first = tl.min(tl.where(r < R, image, 0x7fffffffffffffff), 0)
+    last = tl.max(tl.where(r < R, image, -1), 0)
+    if first == last:  # usual image-major samples: one atomic for the whole block
+        tl.atomic_max(dst + first, tl.max(vmax, 0), sem='relaxed')
+    else:  # public flat-position API allows arbitrary order and unequal sample counts per image
+        tl.atomic_max(dst + image, vmax, r < R, sem='relaxed')
+
+
+def _sampled_amax(amax, g, rows, pixels):
+    g = g.contiguous()
+    R, C = g.shape
+    if R:
+        _sample_amax[(triton.cdiv(R, 16),)](g, rows, amax, R, C, pixels, 16, triton.next_power_of_2(C), num_warps=4)
 
 
 class VGG16Features(torch.nn.Module):
@@ -109,6 +138,13 @@ class VGG16Features(torch.nn.Module):
                    (N, H, W, C, dz.shape[-1]))
         return dx
 
+    def dgrad_unpool(self, dz, i, act, idx):
+        N, H, W, C = act.shape
+        dx = torch.empty(N, 2 * H, 2 * W, C, device=act.device, dtype=torch.float16)
+        self._conv('dgrad_unpool', (self.acc16, dz.data_ptr(), getattr(self, f'w{i}').data_ptr(), act.data_ptr(),
+                                   idx.data_ptr(), dx.data_ptr()), (N, H, W, C, dz.shape[-1]))
+        return dx
+
     def conv_in(self, x, normalized):  # conv1_1 from the images (N, 3, H, W) or the normalised input (N, H, W, 3)
         x = x.float()
         if normalized:
@@ -129,13 +165,6 @@ class VGG16Features(torch.nn.Module):
         idx = torch.empty(N, H // 2, W // 2, C, device=a.device, dtype=torch.uint8) if argmax else None
         vgg_cuda.pool(a.data_ptr(), y.data_ptr(), idx.data_ptr() if argmax else 0, N, H, W, C, _stream())
         return y, idx
-
-    @staticmethod
-    def unpool(g, idx):
-        N, h, w, C = g.shape
-        out = torch.empty(N, 2 * h, 2 * w, C, device=g.device, dtype=torch.float16)
-        vgg_cuda.unpool(g.data_ptr(), idx.data_ptr(), out.data_ptr(), N, 2 * h, 2 * w, C, _stream())
-        return out
 
 
 def _scatter(dz, act, rows, g, scale, add):
@@ -203,7 +232,7 @@ class _VGG(torch.autograd.Function):
             if gm is not None:
                 amax = torch.maximum(amax, torch.linalg.vector_norm(gm, float('inf'), (1, 2, 3)).float())
             if gs is not None:
-                amax.scatter_reduce_(0, r // (act.shape[1] * act.shape[2]), torch.linalg.vector_norm(gs, float('inf'), 1).float(), 'amax')
+                _sampled_amax(amax, gs, r, act.shape[1] * act.shape[2])
         scale = torch.exp2(9 - torch.log2(amax).ceil()).clamp(2.0 ** -60, 2.0 ** 60)
 
         def feat(l, act, dz):  # add the gradients of feature layer l (dz: gradient at its pre-activation, None = 0)
@@ -223,21 +252,21 @@ class _VGG(torch.autograd.Function):
 
         dz = feat(4, a51, None)
         if dz is not None:
-            dz = vgg.unpool(vgg.dgrad(dz, 10, p4), i4)  # conv5_1 -> pre-activation of relu4_3
+            dz = vgg.dgrad_unpool(dz, 10, p4, i4)  # conv5_1 -> pre-activation of relu4_3
             dz = vgg.dgrad(dz, 9, a42)
             dz = vgg.dgrad(dz, 8, a41)
         dz = feat(3, a41, dz)
         if dz is not None:
-            dz = vgg.unpool(vgg.dgrad(dz, 7, p3), i3)
+            dz = vgg.dgrad_unpool(dz, 7, p3, i3)
             dz = vgg.dgrad(dz, 6, a32)
             dz = vgg.dgrad(dz, 5, a31)
         dz = feat(2, a31, dz)
         if dz is not None:
-            dz = vgg.unpool(vgg.dgrad(dz, 4, p2), i2)
+            dz = vgg.dgrad_unpool(dz, 4, p2, i2)
             dz = vgg.dgrad(dz, 3, a21)
         dz = feat(1, a21, dz)
         if dz is not None:
-            dz = vgg.unpool(vgg.dgrad(dz, 2, p1), i1)
+            dz = vgg.dgrad_unpool(dz, 2, p1, i1)
             dz = vgg.dgrad(dz, 1, a11)
         dz = feat(0, a11, dz)
         nones = (None,) * (4 + len(rows))

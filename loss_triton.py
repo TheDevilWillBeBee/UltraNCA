@@ -1,6 +1,7 @@
 """Triton kernels of the compiled texture loss.
 - nearest: tiled relaxed-EMD nearest pairs (TF32 or 3xTF32; fp16 for fp16-valued features, exact). Only row/column
   maxima and their indices leave each tile; no dense similarity matrix is stored.
+- remd_grad_selected: compute only the selected REMD direction per image; reverse matches accumulate in FP32.
 - cov_l1, cov_l1_grad: the covariance term mean |cov(x) - cov(y)| of fp16-valued features and its gradient, on fp16
   tensor cores with fp32 accumulation (exact products): cov = (v^T v - n m^T m) / (n - 1), per tile of the upper
   triangle, only the per-tile sums of |cov(x) - cov(y)| and the int8 signs leave the kernel.
@@ -67,6 +68,54 @@ def nearest(x: torch.Tensor, y: torch.Tensor, nx: torch.Tensor, ny: torch.Tensor
     j = ix.gather(1, sx[:, None, :]).squeeze(1).long()
     i = iy.gather(1, sy[:, None, :]).squeeze(1).long()
     return vx, j, vy, i
+
+
+@triton.jit
+def _remd_bwd_selected(X, Y, NX, NY, I, J, SIDE, G, OUT, N: tl.constexpr, M: tl.constexpr, C: tl.constexpr,
+                       G0: tl.constexpr, BR: tl.constexpr, BC: tl.constexpr):
+    """One direction per image. The reverse direction accumulates repeated nearest-x indices, as scatter_add."""
+    block, b = tl.program_id(0), tl.program_id(1)
+    p, c = block * BR + tl.arange(0, BR), tl.arange(0, BC)
+    x_side = tl.load(SIDE + b)
+    if x_side:
+        valid = p < N
+        ix = p
+        iy = tl.load(J + b * N + p, valid, 0).to(tl.int32)
+        weight = -tl.load(G + b * G0) / N
+    else:
+        valid = p < M
+        ix = tl.load(I + b * M + p, valid, 0).to(tl.int32)
+        iy = p
+        weight = -tl.load(G + b * G0) / M
+    x = tl.load(X + (b * N + ix[:, None]) * C + c[None, :], valid[:, None] & (c[None, :] < C), 0).to(tl.float32)
+    y = tl.load(Y + (b * M + iy[:, None]) * C + c[None, :], valid[:, None] & (c[None, :] < C), 0).to(tl.float32)
+    nx = tl.load(NX + b * N + ix, valid, 0)
+    ny = tl.load(NY + b * M + iy, valid, 0)
+    d = nx * ny + 1.e-10
+    dot = tl.sum(x * y, 1)
+    factor = dot * ny / (nx * d * d)
+    factor = tl.where(tl.abs(factor) < float('inf'), factor, 0.)  # nan_to_num(0, 0, 0), including zero vectors
+    grad = weight * (y / d[:, None] - factor[:, None] * x)
+    out = OUT + (b * N + ix[:, None]) * C + c[None, :]
+    if x_side:
+        tl.store(out, grad, valid[:, None] & (c[None, :] < C))
+    else:
+        tl.atomic_add(out, grad, valid[:, None] & (c[None, :] < C), sem='relaxed')
+
+
+@triton_op('ultranca::remd_grad_selected', mutates_args={})
+def remd_grad_selected(g: torch.Tensor, x: torch.Tensor, y: torch.Tensor, nx: torch.Tensor, ny: torch.Tensor,
+                       i: torch.Tensor, j: torch.Tensor, x_side: torch.Tensor) -> torch.Tensor:
+    """REMD image gradient for contiguous feature sets. Evaluate only the selected direction, on the GPU;
+    repeated reverse matches use FP32 atomics, with the same accumulation-order caveat as torch.scatter_add."""
+    b, n, c = x.shape
+    m = y.shape[1]
+    assert all(v.is_contiguous() for v in (x, y, nx, ny, i, j, x_side))
+    out = torch.zeros((b, n, c), device=x.device, dtype=torch.float32)
+    wrap_triton(_remd_bwd_selected)[(triton.cdiv(max(n, m), 16), b)](
+        x, y, nx, ny, i, j, x_side, g, out, n, m, c, g.stride(0), 16, triton.next_power_of_2(c),
+        num_warps=4, enable_fp_fusion=False)
+    return out
 
 
 @triton.jit

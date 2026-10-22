@@ -39,6 +39,8 @@ python ncaops/testing/test_loss_ms.py  # multi-scale OT loss vs Cells2Pixels' Ap
 python train_lppn.py                   # config_lppn.yml -> runs/lppn/<texture>/{model.pth, siren.pth}, <texture>.png, log.json
 python benchmark_lppn.py --settings A B C --modes whole crops
 python ncaops/testing/test_vgg.py --bench  # fused VGG16 vs torchvision (bash ncaops/build.sh fetches CUTLASS headers once)
+python ncaops/testing/test_vgg_optimizations.py  # cached sampling, chunked gradients, REMD backward and gradient scaling
+python ncaops/testing/test_vgg_unpool.py  # fused backward unpooling: kernel and image-gradient checks
 python benchmark_vgg.py --N 32 128         # single-scale OT loss at 256²: eager / compile / current / fused VGG
 ```
 
@@ -545,10 +547,60 @@ against 1.00 – 1.04 / 1.06 – 1.10 for the second torchvision seed (the first
 1.05 – 1.19); the occasional failed target (OT judge 1.3 – 2.3x) appears with either VGG (torchvision 2, first fused
 version 3 of 64 target runs; none in the 32 of the current one). `config_lppn.yml` keeps `vgg: torch` as the default.
 
+**VGG OT loss optimizations.** The loss retains these measured improvements:
+
+- Gather cached target IDs and spatial positions together, avoiding full feature-map copies per render.
+  Repeated target IDs still get independent samples. This applies to both VGG backends.
+- Validate crop factors using CPU shape metadata and retain crop constants and term weights on the device,
+  removing the former CUDA `tolist()` synchronization and repeated constant uploads.
+- Reuse the fixed full-image window when `num_scales == 1` and image resolution equals `patch`. This saves
+  approximately 1–4% at smaller batches; no measurable gain at 128 images. Skipping unused crop RNG draws changes
+  subsequent seeded feature samples, while preserving their distribution and the normalization arithmetic.
+- Compute only the selected REMD direction per image. Reverse matches accumulate with FP32 atomics, so
+  accumulation order can differ from the former `scatter_add` implementation.
+- Reduce sampled feature gradients directly to per-image maxima for the existing power-of-two scaling.
+- Fuse backward unpooling into the preceding CUTLASS convolution's output stores at all four pooling boundaries.
+  This removes four kernel launches and four pooled-gradient intermediates per VGG backward. The convolution
+  arithmetic and precision settings are retained; matching tile choices give bitwise-identical image gradients.
+
+RTX 4090, 256² images, 1024 samples, FP16 accumulation, complete loss forward + backward. The first pass
+(target sampling, crop constants, REMD backward, gradient maxima) compared to `7095a0d`, using 15 interleaved
+measurements after warmup with shared convolution tile choices:
+
+| Targets | Images | Before | After first pass | Peak allocated memory, before / after |
+|---|---:|---:|---:|---:|
+| Cached (8 targets) | 32 | 16.46 ms | 15.64 ms | 2.1 / 1.6 GiB |
+| Cached (8 targets) | 128 | 64.51 ms | 59.35 ms | 6.2 / 4.7 GiB |
+| Recomputed (one per image) | 32 | 20.83 ms | 19.78 ms | 2.0 / 2.0 GiB |
+| Recomputed (one per image) | 128 | 83.87 ms | 79.40 ms | 6.2 / 6.2 GiB |
+
+A separate interleaved comparison isolates backward-unpool fusion, with the other optimizations already enabled:
+
+| Targets | Images | Before fusion | After fusion |
+|---|---:|---:|---:|
+| Cached | 32 | 15.43 ms | 15.19 ms |
+| Cached | 128 | 57.08 ms | 55.35 ms |
+| Recomputed | 32 | 19.18 ms | 18.79 ms |
+| Recomputed | 128 | 79.06 ms | 76.92 ms |
+
+Fusion adds a 1.5–3% loss-only improvement and also benefits FP32 accumulation; overall peak allocation is
+unchanged because the peak occurs elsewhere. These measurements are not full training speedups.
+
+`test_vgg_optimizations.py` covers sampling, repeated target IDs, partial chunks, weighted gradients, both VGG
+backends, target modes, REMD corner cases, and gradient scaling. `test_vgg_unpool.py` checks every convolution tile,
+both accumulations, rectangular/partial tiles, graph replay, and full image gradients against a test-only PyTorch
+unpool reference. The existing VGG and multi-scale loss tests also pass. The selected REMD backward can introduce
+small rounding differences: a matched compiled comparison to the original loss gave identical values and 7.7e-4
+relative L2 image-gradient error.
+
+Rebuild the VGG extension after updating sources (`bash ncaops/build.sh`). Measure the current cached loss with
+`python benchmark_vgg.py --impl cuda16 --precision fp32 --N 32 128 --cached --reps 15`; omit `--cached` for fresh
+targets. `config_lppn.yml` keeps `vgg: torch` as the default; the fused kernels use `vgg: cuda`.
+
 ## Planned next steps (in rough order of expected gain)
 
 1. **Backward occupancy / latency**: 255 registers and ~47 KB of shared memory per 4-warp block give 8 warps per SM, and the kernel issues every 9 cycles per warp (stalls: tensor pipe 2.4, weight-fragment loads 2.0, dependencies 1.7, barriers 1.6 cycles per instruction). On the A100 / H100 (164 / 228 KB), an 8-warp block of two 4-warp teams with the weight fragments resident in shared memory (~140 KB) would remove the fragment-load stalls; it does not fit 100 KB. Tried and dropped: two warps per pixel group (8-warp blocks at 128 registers, 16 warps per SM): twice the instructions per MMA, 15–30 % slower; a 168-register cap (spills). A100 (section 9): the fragment loads cost 132 of 688 µs but are not L1 misses (a 28 KB L1 costs 3.5 %), so shared-memory residency would save little; the 168-register cap with 3 blocks per SM is 12 % slower.
 2. **Fusing the adjoint** stays a loss on 100 KB GPUs (see above); with 164 KB or more, the gather could stage a tile's dp in shared memory instead of reading it 9 times from L2. A100 (section 9): a standalone adjoint that stages the patch's records in shared memory was no faster (the kernel is latency- and occupancy-bound), and the fused version would also recompute the halo rows.
-3. **OT loss**: sections 7–8 reduce pooling and REMD traffic; section 12 replaces VGG by fused kernels whose convolutions run at the tensor-core limit and moves the OT terms to fp16 tensor cores. What remains at 128 images of 256² (fused, fp16 accumulation, 81 ms): the convolutions (58 ms; Winograd F(2x2, 3x3) would do 2.25x fewer multiplies, at some cost in fp16 accuracy), pooling / unpooling as separate passes (~10 ms: fusing pooling into the convolution epilogue needs tiles that cover two image rows), the relaxed-EMD backward (~4 ms of compiled gathers and a scatter; its x side could join the covariance-gradient epilogue). On A100 / H100 fp16 accumulation gains nothing (fp32 accumulation already runs at the full tensor rate there); H100 would need `wgmma` kernels (CUTLASS 3.x) to reach its peak.
+3. **OT loss**: the retained optimizations above bring the measured 128-image loss to ~55 ms with cached targets or ~77 ms with recomputed targets (256², FP16 accumulation). Forward convolution/pooling fusion and packed ReLU masks remain candidates. On A100 / H100, FP16 accumulation gains nothing because FP32 accumulation already runs at the full tensor rate; H100 would need `wgmma` kernels (CUTLASS 3.x) to reach its peak.
 4. **Sparse growing grids**: redundant clearing and alive-mask scans are removed in section 7; the forward still scans all strips for living cells. Tracking active tiles could reduce this remaining cost on very large, mostly empty grids.
 5. **Other GPUs**: H100 `wgmma`; other (C, HID) instantiations (`dispatch()` in `nca_cuda.cu`; C a multiple of 4, HID a multiple of 32).

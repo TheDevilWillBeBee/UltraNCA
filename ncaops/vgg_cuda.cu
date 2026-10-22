@@ -7,8 +7,9 @@
 //                activation that was the convolution's input, so the output is the gradient at its pre-activation;
 //                the gradients carry a per-image power-of-2 scale (vgg_ops.py) that keeps them in fp16's range)
 // so no separate bias, relu or relu-backward pass touches the activations. conv1_1 and the image gradient (3 channels)
-// are CUDA-core kernels (end of file). 2 x 2 max pooling keeps a 1-byte argmax for the backward; features are gathered
-// at sampled positions (rows of the flattened (N h w, C) map) in the forward and their gradients scattered (with the
+// are CUDA-core kernels (end of file). 2 x 2 max pooling keeps a 1-byte argmax; at pooling boundaries, the backward
+// convolution can directly store the unpooled gradient (vgg_unpool.cuh). Features are gathered at sampled positions
+// (rows of the flattened (N h w, C) map) in the forward and their gradients scattered (with the
 // relu mask) into the layer gradient in the backward. Tile shapes 128 x 128, 128 x 64 and 128 x 256 per convolution;
 // vgg_ops.py picks the fastest per layer shape by timing them once.
 // Pointers are passed as integers (data_ptr()); vgg_ops.py allocates every tensor (contiguous NHWC, channels multiples
@@ -107,6 +108,8 @@ using DgradMaskOp = cutlass::conv::device::ImplicitGemmConvolution<typename cutl
     typename T::Warp, Instr, MaskByPositiveSource<f16, 8, Acc>, Swizzle, T::Stages, cutlass::arch::OpMultiplyAdd,
     cutlass::conv::IteratorAlgorithm::kOptimized, cutlass::conv::StrideSupport::kUnity>::Kernel>;
 
+#include "vgg_unpool.cuh"
+
 static cutlass::conv::Conv2dProblemSize problem(int N, int H, int W, int C, int K)
 {  // 3 x 3, padding 1, stride 1
     return cutlass::conv::Conv2dProblemSize({N, H, W, C}, {K, 3, 3, C}, {1, 1, 1, 1}, {1, 1}, {1, 1}, {N, H, W, K},
@@ -165,6 +168,33 @@ void dgrad_mask(int config, bool acc16, uintptr_t dy, uintptr_t w, uintptr_t act
     with_tiles(config, [&](auto tiles) { acc16 ? run(tiles, f16{}) : run(tiles, float{}); });
 }
 
+// As dgrad_mask, but directly write the unpooled (N, 2H, 2W, C) result; no pooled gradient allocation or pass.
+void dgrad_unpool(int config, bool acc16, uintptr_t dy, uintptr_t w, uintptr_t act, uintptr_t idx, uintptr_t dx,
+                 int N, int H, int W, int C, int K, uintptr_t stream)
+{
+    auto run = [&](auto tiles, auto acc) {
+        using Kernel = typename DgradUnpool<decltype(tiles), decltype(acc)>::Kernel;
+        using Op = cutlass::conv::device::ImplicitGemmConvolution<Kernel>;
+        typename Kernel::Arguments args{
+            problem(N, H, W, C, K), {(f16 *)dy, NHWC::packed({N, H, W, K})},
+            {(f16 *)w, NHWC::packed({K, 3, 3, C})}, {(f16 *)act, NHWC::packed({N, H, W, C})},
+            {(f16 *)dx, NHWC::packed({N, H, W, C})}, {1.f}};
+        auto st = Op::can_implement(args);
+        if (st != cutlass::Status::kSuccess)
+            throw std::runtime_error(std::string("vgg_cuda: dgrad_unpool not supported: ") + cutlassGetStatusString(st));
+        typename Kernel::Params params(args);
+        params.iterator_D.argmax = (uint8_t const *)idx;
+        params.iterator_D.width = W;
+        int const smem = sizeof(typename Kernel::SharedStorage);
+        if (smem >= (48 << 10))
+            cuda_check(cudaFuncSetAttribute(cutlass::Kernel<Kernel>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+        auto grid = Swizzle().get_grid_shape(params.grid_tiled_shape);
+        cutlass::Kernel<Kernel><<<grid, Kernel::kThreadCount, smem, (cudaStream_t)stream>>>(params);
+        cuda_check(cudaGetLastError());
+    };
+    with_tiles(config, [&](auto tiles) { acc16 ? run(tiles, f16{}) : run(tiles, float{}); });
+}
+
 // ---------------------------------------------------------------- pooling, gather, scatter (8 channels per thread)
 union Pack8 {
     uint4 u;
@@ -197,31 +227,6 @@ __global__ void pool_kernel(const uint4 *__restrict__ in, uint4 *__restrict__ ou
     out[t] = best.u;
     if (idx)  // only with a backward
         idx[t] = make_uint2(arg[0] | arg[1] << 8 | arg[2] << 16 | arg[3] << 24, arg[4] | arg[5] << 8 | arg[6] << 16 | arg[7] << 24);
-}
-
-// out (N, H, W, C): g (N, H/2, W/2, C) at each window's argmax, 0 elsewhere
-__global__ void unpool_kernel(const uint4 *__restrict__ g, const uint2 *__restrict__ idx, uint4 *__restrict__ out, int H,
-                              int W, int C8, long total)
-{
-    const long t = (long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (t >= total)
-        return;
-    const int c = t % C8, ow = (t / C8) % (W / 2), oh = (t / C8 / (W / 2)) % (H / 2);
-    const long n = t / C8 / (W / 2) / (H / 2);
-    Pack8 v, o;
-    v.u = g[t];
-    const uint2 a = idx[t];
-#pragma unroll
-    for (int k = 0; k < 4; ++k)
-    {
-#pragma unroll
-        for (int i = 0; i < 8; ++i)
-        {
-            const int arg = ((i < 4 ? a.x : a.y) >> (8 * (i & 3))) & 0xff;
-            o.s[i] = arg == k ? v.s[i] : 0;
-        }
-        out[((n * H + 2 * oh + (k >> 1)) * W + 2 * ow + (k & 1)) * C8 + c] = o.u;
-    }
 }
 
 // out (R, C) fp32 = f (rows, C) fp16 at rows[r]
@@ -294,13 +299,6 @@ void pool(uintptr_t in, uintptr_t out, uintptr_t idx, int N, int H, int W, int C
 {
     const long total = (long)N * (H / 2) * (W / 2) * (C / 8);
     pool_kernel<<<blocks(total), 256, 0, (cudaStream_t)stream>>>((const uint4 *)in, (uint4 *)out, (uint2 *)idx, H, W, C / 8, total);
-    cuda_check(cudaGetLastError());
-}
-
-void unpool(uintptr_t g, uintptr_t idx, uintptr_t out, int N, int H, int W, int C, uintptr_t stream)
-{
-    const long total = (long)N * (H / 2) * (W / 2) * (C / 8);
-    unpool_kernel<<<blocks(total), 256, 0, (cudaStream_t)stream>>>((const uint4 *)g, (const uint2 *)idx, (uint4 *)out, H, W, C / 8, total);
     cuda_check(cudaGetLastError());
 }
 
@@ -469,6 +467,9 @@ void dgrad_in(uintptr_t dz, uintptr_t w, uintptr_t mult, uintptr_t cmul, uintptr
 
 NB_MODULE(vgg_cuda, m)
 {
+    m.def("dgrad_unpool", &dgrad_unpool, "config"_a, "acc16"_a, "dy"_a, "w"_a, "act"_a, "idx"_a, "dx"_a,
+          "N"_a, "H"_a, "W"_a, "C"_a, "K"_a, "stream"_a,
+          "Convolution input gradient with ReLU mask and fused 2x2 unpooling: output (N, 2H, 2W, C)");
     m.def("fprop", &fprop, "config"_a, "acc16"_a, "x"_a, "w"_a, "b"_a, "y"_a, "N"_a, "H"_a, "W"_a, "C"_a, "K"_a, "stream"_a,
           "y (N, H, W, K) = relu(conv3x3(x (N, H, W, C), w (K, 3, 3, C)) + b (K)), fp16, fp32 or (acc16) fp16 "
           "accumulation; config 0: 128 x 128 tiles, 1: 128 x 64, 2: 128 x 256");
@@ -484,8 +485,6 @@ NB_MODULE(vgg_cuda, m)
     m.def("pool", &pool, "x"_a, "y"_a, "idx"_a, "N"_a, "H"_a, "W"_a, "C"_a, "stream"_a,
           "2 x 2 max pooling of x (N, H, W, C) fp16 -> y (N, H/2, W/2, C), idx (uint8 window position of the first max; "
           "0: not written)");
-    m.def("unpool", &unpool, "g"_a, "idx"_a, "out"_a, "N"_a, "H"_a, "W"_a, "C"_a, "stream"_a,
-          "gradient of pool: out (N, H, W, C) = g (N, H/2, W/2, C) at the argmax, 0 elsewhere");
     m.def("gather", &gather, "f"_a, "rows"_a, "out"_a, "R"_a, "C"_a, "stream"_a,
           "out (R, C) fp32 = f (rows, C) fp16 at rows (R) int64");
     m.def("scatter", &scatter, "dz"_a, "act"_a, "rows"_a, "g"_a, "g_type"_a, "scale"_a, "M"_a, "R"_a, "C"_a, "add"_a, "stream"_a,

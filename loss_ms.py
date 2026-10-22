@@ -9,7 +9,8 @@ of the target's. The image's loss is the sum over layers, the mean over a scale'
 Target side (target_mode):
 - 'whole': the target resized to patch * 2^s at scale s (the original): one term per patch, each against the whole
   target. For fixed targets, targets() computes this once and forward() takes the cache; otherwise VGG runs at
-  patch * 2^s on the target at every call.
+  patch * 2^s on the target at every call. Cached target IDs and positions are gathered together, without expanding
+  the full target maps to the render batch.
 - 'crops': the target cut and downsampled like the image (its own random windows; VGG at the patch resolution only,
   for targets that change at every call). pairing 'pooled': one term per scale between the features of all the
   image's crops of the scale and those of all the target's crops of the scale (both sides pooled: the crops of a
@@ -31,8 +32,8 @@ import torchvision
 import triton
 import triton.language as tl
 
-from loss import _REMD, _moments, _remd_grad
-from loss_triton import nearest, cov_l1, cov_l1_grad
+from loss import _REMD, _moments
+from loss_triton import nearest, cov_l1, cov_l1_grad, remd_grad_selected
 
 # compiling the REMD's Triton kernel logs one warning per inline-asm TF32 rounding (harmless; torch resets log levels,
 # so a filter on the logger that emits them: torch/_higher_order_ops/triton_kernel_wrap.py logs as torch._dynamo)
@@ -109,7 +110,7 @@ class _OT16(torch.autograd.Function):
     def backward(ctx, g):
         x, y, nx, ny, i, j, x_side, mx, my, sign = ctx.saved_tensors
         b, n, c = x.shape
-        r = _remd_grad(g, x.float(), y.float(), nx, ny, i, j, x_side).contiguous()
+        r = remd_grad_selected(g, x, y, nx, ny, i, j, x_side)
         vec = g[:, None] * torch.sign(mx - my) / (c * n)  # the mean term
         return cov_l1_grad(x, mx, sign, g * 2 / (c * c * (n - 1)), vec, r), None
 
@@ -119,15 +120,20 @@ def _draw(sets, M, n, base):
     return torch.rand(sets, M, device=base.device).topk(n, 1, sorted=False).indices + base[:, None]
 
 
-def _sample(f, n):
-    """n random positions per item of f (b, M, c) -> (b, n, c); all of them (any order) if M <= n."""
+def _sample(f, n, rows=None):
+    """n positions per item, optionally selecting target IDs at the same time as positions. This avoids copying
+    whole cached maps for each render before sampling them. Repeated target IDs get independent position draws."""
     b, M, c = f.shape
+    if rows is not None:
+        b = rows.shape[0]
     if M <= n:
-        return f
+        return f if rows is None else f[rows]
     if M > 64 * n:
         idx = torch.randint(0, M, (b, n), device=f.device)
     else:
         idx = torch.rand(b, M, device=f.device).topk(n, 1, sorted=False).indices
+    if rows is not None:
+        return f[rows[:, None], idx]
     return f.gather(1, idx[..., None].expand(-1, -1, c))
 
 
@@ -154,6 +160,10 @@ class MultiScaleOTLoss(torch.nn.Module):
         self.K = sum(self.crops)
         self.scale_of = [s for s in range(num_scales) for _ in range(self.crops[s])]
         self.pooled = target_mode == 'crops' and pairing == 'pooled'
+        weights = [1 / self.num_scales] * self.num_scales if self.pooled else \
+            [1 / (self.num_scales * self.crops[s]) for s in self.scale_of]
+        self.register_buffer('_term_weights', torch.tensor(weights), persistent=False)
+        self._window_constants = {}
         # torch.compile fuses the OT terms' elementwise passes over (patches, n, c) and VGG's bias / relu epilogues
         # (fused VGG: the OT terms only)
         compiled = (lambda f: torch.compile(f, dynamic=False)) if compile else (lambda f: f)
@@ -166,16 +176,31 @@ class MultiScaleOTLoss(torch.nn.Module):
     # ---------------------------------------------------------------- patches and features
     def _windows(self, N, R, device):
         """Patch specs of N images (image-major, K patches each): image, window offset, factor."""
-        P = self.patch
-        size = torch.tensor([R // 2 ** s for s in self.scale_of], device=device)
-        assert all(R % 2 ** s == 0 and (R // 2 ** s) % P == 0 for s in self.scale_of), 'crops must be multiples of the patch'
-        f = (size // P).int()
-        assert all(v == 1 or v % 2 == 0 for v in f.tolist()), 'downsampling factors 1 or even'
-        hi = (R - size + 1)[None].expand(N, -1)  # window offsets uniform in [0, R - size]
+        key = (N, R, torch.device(device))
+        if self.num_scales == 1 and R == self.patch:
+            # The only window is the whole image. Avoid random draws and coordinate kernels whose output
+            # would always be zero; retain the same patch normalization and its backward arithmetic.
+            if key not in self._window_constants:
+                n = torch.arange(N, device=device, dtype=torch.int32)
+                zero = torch.zeros(N, device=device, dtype=torch.int32)
+                one = torch.ones(N, device=device, dtype=torch.int32)
+                self._window_constants[key] = n, zero, zero, one
+            return self._window_constants[key]
+        if key not in self._window_constants:
+            P = self.patch
+            sizes = [R // 2 ** s for s in self.scale_of]
+            assert all(R % 2 ** s == 0 and (R // 2 ** s) % P == 0 for s in self.scale_of), 'crops must be multiples of the patch'
+            factors = [v // P for v in sizes]
+            assert all(v == 1 or v % 2 == 0 for v in factors), 'downsampling factors 1 or even'
+            # All three depend only on shapes. Keep their host-to-device copies out of the training loop.
+            hi = torch.tensor([R - v + 1 for v in sizes], device=device)[None]
+            f = torch.tensor(factors, device=device, dtype=torch.int32).repeat(N)
+            n = torch.arange(N, device=device, dtype=torch.int32).repeat_interleave(self.K)
+            self._window_constants[key] = n, hi, f
+        n, hi, f = self._window_constants[key]
         oy = (torch.rand(N, self.K, device=device) * hi).long().clamp_max(hi - 1)
         ox = (torch.rand(N, self.K, device=device) * hi).long().clamp_max(hi - 1)
-        n = torch.arange(N, device=device)[:, None].expand(-1, self.K)
-        return [v.reshape(-1).int().contiguous() for v in (n, oy, ox, f[None].expand(N, -1))]
+        return [n, oy.reshape(-1).int(), ox.reshape(-1).int(), f]
 
     def _build(self, img, spec, P, dtype):
         """img (N, 3, R, R) fp32 -> normalised patches (len(spec[0]), 3, P, P), channels_last."""
@@ -241,13 +266,12 @@ class MultiScaleOTLoss(torch.nn.Module):
         return _REMD.apply(x, y, True) + (mx - my).abs().mean((1, 2)) + (cx - cy).abs().mean((1, 2))
 
     def _weights(self, device):  # weight of each term of an image: per patch, or per scale (pooled)
-        if self.pooled:
-            return torch.full((self.num_scales,), 1 / self.num_scales, device=device)
-        return torch.tensor([1 / (self.num_scales * self.crops[s]) for s in self.scale_of], device=device)
+        return self._term_weights.to(device)
 
-    def _patch_losses(self, gen, tgt, n_img):
+    def _patch_losses(self, gen, tgt, n_img, target_rows=None):
         """gen: per layer (n_img K, M, c) of the image patches (or already sampled: (n_img K, n, c); pooled: per scale
         (n_img, n, c)); tgt: per scale per layer (n_img, M_s, c) (whole) or per layer (n_img K, M, c) (crops).
+        target_rows selects cached targets directly during sampling in whole mode.
         -> loss per term (n_img, K) or, pooled, (n_img, num_scales)"""
         K, loss = self.K, 0.0
         if self.pooled:  # one term per scale: all crops of the scale on both sides
@@ -268,18 +292,18 @@ class MultiScaleOTLoss(torch.nn.Module):
             n = min(x.shape[1], self.n)
             xs = _sample(x, n)
             if self.mode == 'whole':  # per patch k: the target map of its scale
-                ys = torch.stack([_sample(tgt[self.scale_of[k]][l], n) for k in range(K)], 1)
+                ys = torch.stack([_sample(tgt[self.scale_of[k]][l], n, target_rows) for k in range(K)], 1)
             else:  # paired: patch k against target crop k
                 ys = _sample(tgt[l], n)
             loss = loss + self._terms(xs, ys.reshape(n_img * K, n, -1))
         return loss.reshape(n_img, K)
 
-    def _loss(self, x, tgt, weights):
+    def _loss(self, x, tgt, weights, target_rows=None):
         """normalised patches x (n_img K, 3, P, P) -> per-image loss (n_img,)"""
-        return (self._patch_losses(self.features(x), tgt, x.shape[0] // self.K) * weights).sum(1)
+        return (self._patch_losses(self.features(x), tgt, x.shape[0] // self.K, target_rows) * weights).sum(1)
 
-    def _ot(self, gen, tgt, weights, n_img):
-        return (self._patch_losses(gen, tgt, n_img) * weights).sum(1)
+    def _ot(self, gen, tgt, weights, n_img, target_rows=None):
+        return (self._patch_losses(gen, tgt, n_img, target_rows) * weights).sum(1)
 
     # ---------------------------------------------------------------- fused VGG: positions drawn before it runs
     def _rows(self, n_img, device):
@@ -303,7 +327,7 @@ class MultiScaleOTLoss(torch.nn.Module):
             shapes.append(sh)
         return rows, shapes
 
-    def _fused_loss(self, x, tgt, weights):
+    def _fused_loss(self, x, tgt, weights, target_rows=None):
         """normalised patches x (n_img K, P, P, 3) -> per-image loss (n_img,). The image features are fp32 samples of
         the fused VGG, also where every position is used: their gradients stay fp32 until VGG scales them."""
         n_img = x.shape[0] // self.K
@@ -315,7 +339,7 @@ class MultiScaleOTLoss(torch.nn.Module):
                 gen.append(s.reshape(*sh[0], -1))
                 continue
             gen.append([p.reshape(a, b, -1) for p, (a, b) in zip(s.split([a * b for a, b in sh]), sh)])
-        return self._ot_fn(gen, tgt, weights, n_img)
+        return self._ot_fn(gen, tgt, weights, n_img, target_rows)
 
     def _chunk_images(self, N, R):
         # GB: saved VGG activations and OT terms per patch; forward-only target maps up to R x R
@@ -349,7 +373,7 @@ class _MSLoss(torch.autograd.Function):
             with torch.no_grad():
                 r = rows[a:b]
                 if m.mode == 'whole':
-                    tgt = [[f[r] for f in fs] for fs in cache] if cache is not None else m._whole(target[r].float().contiguous())
+                    tgt = cache if cache is not None else m._whole(target[r].float().contiguous())
                 else:
                     tspec = m._windows(n_img, R, img.device)
                     tgt = m._features_fn(m._build(target[r].float().contiguous(), tspec, m.patch, m._dtype()))
@@ -358,11 +382,11 @@ class _MSLoss(torch.autograd.Function):
                 x = x.permute(0, 2, 3, 1)  # (patches, P, P, 3) contiguous
             if not ctx.needs_input_grad[0]:  # evaluation: no VGG backward
                 with torch.no_grad():
-                    loss[a:b] = m._loss_fn(x, tgt, weights)
+                    loss[a:b] = m._loss_fn(x, tgt, weights, r if cache is not None else None)
                 continue
             with torch.enable_grad():
                 x.requires_grad_()
-                per_img = m._loss_fn(x, tgt, weights)
+                per_img = m._loss_fn(x, tgt, weights, r if cache is not None else None)
                 gx, = torch.autograd.grad(per_img.sum(), x)
             if m.fused:
                 gx = gx.permute(0, 3, 1, 2)
