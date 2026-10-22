@@ -29,9 +29,9 @@ def rel(a, b):
     return ((a - b).abs().max() / b.abs().max().clamp_min(1e-30)).item()
 
 
-def check(S, N, C, h, w, gmag=1.0, seed=0, mode='lppn', jitter=False):
+def check(S, N, C, h, w, gmag=1.0, seed=0, mode='lppn', jitter=False, hidden=32):
     torch.manual_seed(seed)
-    dec = LPPN(scale=S, mode=mode)
+    dec = LPPN(scale=S, mode=mode, hidden=hidden)
     off = dec.jitter(N) if jitter else None
     p = dec.init(N, C)
     p['wo'] *= 10  # trained decoders have larger output weights than the init
@@ -47,7 +47,7 @@ def check(S, N, C, h, w, gmag=1.0, seed=0, mode='lppn', jitter=False):
         assert e < 1e-4, f'decomposition with offsets: {e:.1e}'
     det = all(torch.equal(gout[k], gout2[k]) for k in gout)
     fwd, fwd_h = rel(out, ref), rel(half, ref)
-    line = f'{mode}{" jitter" if jitter else ""} S={S} N={N} C={C} {h}x{w} |dout|~{gmag:.0e}: forward {fwd:.1e} (fp16 autocast {fwd_h:.1e}); grads'
+    line = f'{mode}{" jitter" if jitter else ""}{f" hidden={hidden}" if hidden != 32 else ""} S={S} N={N} C={C} {h}x{w} |dout|~{gmag:.0e}: forward {fwd:.1e} (fp16 autocast {fwd_h:.1e}); grads'
     worst = 0.0
     for k in gref:
         e, eh = rel(gout[k], gref[k]), rel(ghalf[k], gref[k])
@@ -86,13 +86,13 @@ def local_ensemble_reference():
 
 def bench():
     import time
-    for S, N, h, mode in ((8, 32, 128, 'lppn'), (8, 32, 128, 'ensemble'), (4, 32, 128, 'lppn'), (4, 32, 128, 'ensemble'),
-                          (4, 32, 64, 'lppn'), (4, 32, 64, 'ensemble')):
-        dec = LPPN(scale=S, mode=mode)
+    for S, N, h, mode, hidden in [(S, 32, h, mode, hidden) for S, h in ((8, 128), (4, 128), (4, 64))
+                                  for mode in ('lppn', 'ensemble') for hidden in (32, 24)]:
+        dec = LPPN(scale=S, mode=mode, hidden=hidden)
         p = {k: v.requires_grad_() for k, v in dec.init(N, 16).items()}
         s = (torch.rand(N, 16, h, h, device='cuda') * 2 - 1).requires_grad_()
         g = torch.randn(N, 3, S * h, S * h, device='cuda')
-        for impl in ('cuda', 'eager'):
+        for impl in ('cuda', 'eager') if hidden == 32 else ('cuda',):
             if impl == 'eager':  # 1024^2 x 32 of fp32 activations do not fit: 4 images, times N / 4
                 s, p, g = s[:4].detach().requires_grad_(), {k: v[:4].detach().requires_grad_() for k, v in p.items()}, g[:4]
 
@@ -111,7 +111,7 @@ def bench():
                     fn()
                 torch.cuda.synchronize(); res.append(1000 * (time.time() - t) / 5)
             f = N / len(s)
-            print(f'bench {mode:8s} S={S} N={N} {h}^2 -> {S * h}^2 {impl:5s}: forward {f * res[0]:7.2f} ms, forward + backward {f * res[1]:7.2f} ms'
+            print(f'bench {mode:8s} hidden={hidden} S={S} N={N} {h}^2 -> {S * h}^2 {impl:5s}: forward {f * res[0]:7.2f} ms, forward + backward {f * res[1]:7.2f} ms'
                   + (' (4 images x N / 4)' if f > 1 else ''), flush=True)
 
 
@@ -128,6 +128,11 @@ if __name__ == '__main__':
     for mode in ('lppn', 'ensemble'):  # training-time jitter of the sample positions
         for S in (8, 4):
             check(S, 3, 16, 8, 12, mode=mode, jitter=True, seed=2)
+    for mode in ('lppn', 'ensemble'):  # hidden width 24 (partial k-step)
+        for S in (8, 4):
+            check(S, 3, 16, 8, 12, mode=mode, hidden=24, seed=4)
+            check(S, 2, 16, 12, 7, mode=mode, hidden=24, gmag=1e-7, seed=5)
+            check(S, 3, 16, 8, 12, mode=mode, hidden=24, jitter=True, seed=6)
     torch.manual_seed(3)  # the per-pixel reference at offset 0 is the Renderer2D one
     dec = LPPN(scale=4, mode='lppn')
     s, p = torch.rand(2, 16, 6, 10, device='cuda') * 2 - 1, dec.init(2, 16)

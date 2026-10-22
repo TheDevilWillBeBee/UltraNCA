@@ -34,7 +34,7 @@ class _Decode(torch.autograd.Function):
         # per-image power of two with max |dout * gscale| in [1, 2): fp16 operands of the backward matmuls stay in range
         amax = torch.linalg.vector_norm(dout.view(N, -1), float('inf'), dim=1)  # one pass, no |dout| temporary
         gscale = torch.where(amax > 0, torch.exp2(-torch.floor(torch.log2(amax))), torch.ones_like(amax))
-        size, bands = lppn_cuda.workspace(S, O, h, ens)
+        size, bands = lppn_cuda.workspace(S, O, h, ens, Hd)
         partial = torch.empty(N, bands, size, device=G.device)
         edges = torch.empty((N, 4, h, w, Hd) if ens else (N, bands, 2, w, Hd), device=G.device)
         reduced = torch.empty(N, size, device=G.device)
